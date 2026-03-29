@@ -1,0 +1,37 @@
+uv run python extract_steering_vector.py \
+      --pairs ~/ai/ClaudeInstanceHomeOffices/mosaic-5b3f49a3/intentionality_contrastive_pairs_consolidated.md
+Disabling PyTorch because PyTorch >= 2.4 is required but found 2.3.0
+Parsing contrastive pairs from /Users/stuartswerdloff/ai/ClaudeInstanceHomeOffices/mosaic-5b3f49a3/intentionality_contrastive_pairs_consolidated.md...
+Found 46 contrastive pairs
+
+Loading lmstudio-community/MiniMax-M2.5-MLX-8bit (lazy=True)...
+Fetching 53 files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████| 53/53 [00:00<00:00, 9977.47it/s]
+Download complete: : 0.00B [00:00, ?B/s]              You are using a model of type `minimax_m2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Model loaded. 62 layers.
+Target layers: [15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+
+Extracting steering vectors from 46 pairs across 10 layers...
+  Pair 1/46: reactive...Traceback (most recent call last):
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/extract_steering_vector.py", line 178, in <module>
+    main()
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/extract_steering_vector.py", line 167, in main
+    steering_vectors = extract_steering_vectors(model, tokenizer, pairs, target_layers)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/extract_steering_vector.py", line 99, in extract_steering_vectors
+    reactive_states = get_hidden_states(model, tokenizer, reactive_prompt, target_layers)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/extract_steering_vector.py", line 67, in get_hidden_states
+    h = layer(h, mask=nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1]))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/.venv/lib/python3.12/site-packages/mlx_lm/models/minimax.py", line 219, in __call__
+    r = x + self.self_attn(self.input_layernorm(x), mask, cache)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/.venv/lib/python3.12/site-packages/mlx_lm/models/minimax.py", line 153, in __call__
+    output = scaled_dot_product_attention(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/stuartswerdloff/ai/vllm-mlx/vllm-mlx/.venv/lib/python3.12/site-packages/mlx_lm/models/base.py", line 130, in scaled_dot_product_attention
+    return mx.fast.scaled_dot_product_attention(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: [scaled_dot_product_attention] Mask type must promote to output type bfloat16.
+Download complete: : 0.00B [00:00, ?B/s]
+

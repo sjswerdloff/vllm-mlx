@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "mlx-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "MLX (MedGemma)",
+      "options": {
+        "baseURL": "http://localhost:8000/v1"
+      },
+      "models": {
+        "mlx-community/medgemma-27b-it-bf16": {
+          "name": "MedGemma 27B"
+        }
+      }
+    }
+  },
+  "model": "mlx-local/mlx-community/medgemma-27b-it-bf16"
+}
+
