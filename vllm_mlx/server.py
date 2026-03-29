@@ -98,6 +98,7 @@ from .api.tool_calling import (
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
+    StreamingToolCallFilter,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -1788,7 +1789,12 @@ async def _stream_anthropic_messages(
     yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
 
     # Stream content deltas
+    # StreamingToolCallFilter suppresses tool call XML markup during streaming.
+    # Without this, <minimax:tool_call> content leaks into text deltas and
+    # appears in the client's context alongside the structured tool_use block,
+    # doubling token consumption for every tool call.
     accumulated_text = ""
+    tool_filter = StreamingToolCallFilter()
     completion_tokens = 0
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
@@ -1804,12 +1810,25 @@ async def _stream_anthropic_messages(
 
             if content:
                 accumulated_text += content
-                delta_event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": content},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                # Filter out tool call markup before emitting to client
+                filtered = tool_filter.process(content)
+                if filtered:
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": filtered},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+    # Flush any remaining buffered text
+    remaining = tool_filter.flush()
+    if remaining:
+        delta_event = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": remaining},
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)

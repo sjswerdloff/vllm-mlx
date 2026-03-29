@@ -102,6 +102,109 @@ def clean_output_text(text: str) -> str:
 
 
 # =============================================================================
+# Streaming Tool Call Filter
+# =============================================================================
+
+# Tags that delimit tool call blocks in streaming output.
+# Content inside these tags should be suppressed during streaming because
+# it will be re-emitted as structured tool_use blocks after parsing.
+_TOOL_CALL_TAGS = [
+    ("<minimax:tool_call>", "</minimax:tool_call>"),
+    ("<tool_call>", "</tool_call>"),
+]
+
+
+class StreamingToolCallFilter:
+    """Buffer streaming text to suppress tool call markup.
+
+    Tool call XML (e.g. <minimax:tool_call>...</minimax:tool_call>) arrives
+    split across multiple streaming deltas. This filter detects entry into a
+    tool call block, suppresses all output until the block closes, and emits
+    only non-tool-call text.
+
+    The full unfiltered text is still accumulated separately for tool call
+    parsing at stream end.
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_block = False
+        self._close_tag = ""
+        # Longest open tag - used to determine how much buffer to hold back
+        self._max_open_len = max(len(t[0]) for t in _TOOL_CALL_TAGS)
+
+    def process(self, delta: str) -> str:
+        """Process a streaming delta. Returns text to emit (may be empty)."""
+        self._buffer += delta
+
+        if self._in_block:
+            return self._consume_block()
+        else:
+            return self._scan_for_open()
+
+    def _scan_for_open(self) -> str:
+        """Scan buffer for tool call open tags. Emit safe text."""
+        # Check for complete open tags
+        for open_tag, close_tag in _TOOL_CALL_TAGS:
+            idx = self._buffer.find(open_tag)
+            if idx >= 0:
+                # Found an open tag - emit text before it, enter block mode
+                emit = self._buffer[:idx]
+                self._buffer = self._buffer[idx + len(open_tag):]
+                self._in_block = True
+                self._close_tag = close_tag
+                # Process remainder in case close tag is already in buffer
+                after = self._consume_block()
+                return emit + after
+
+        # No complete open tag found. Check if buffer ends with a partial
+        # match of any open tag - hold that back to avoid emitting a fragment.
+        hold_back = 0
+        for open_tag, _ in _TOOL_CALL_TAGS:
+            for prefix_len in range(min(len(open_tag), len(self._buffer)), 0, -1):
+                if self._buffer.endswith(open_tag[:prefix_len]):
+                    hold_back = max(hold_back, prefix_len)
+                    break
+
+        if hold_back > 0:
+            emit = self._buffer[:-hold_back]
+            self._buffer = self._buffer[-hold_back:]
+            return emit
+
+        # No partial match - safe to emit everything
+        emit = self._buffer
+        self._buffer = ""
+        return emit
+
+    def _consume_block(self) -> str:
+        """Consume content inside a tool call block. Returns empty string
+        unless the block closes and there's text after it."""
+        idx = self._buffer.find(self._close_tag)
+        if idx >= 0:
+            # Block closed - discard content up to and including close tag
+            self._buffer = self._buffer[idx + len(self._close_tag):]
+            self._in_block = False
+            self._close_tag = ""
+            # Process remainder - might have more text or another tool call
+            if self._buffer:
+                return self._scan_for_open()
+            return ""
+        # Still inside block - suppress everything
+        return ""
+
+    def flush(self) -> str:
+        """Flush remaining buffer at end of stream."""
+        if self._in_block:
+            # Unterminated tool call block - discard
+            self._buffer = ""
+            self._in_block = False
+            return ""
+        emit = self._buffer
+        self._buffer = ""
+        return emit
+
+
+# =============================================================================
 # Model Detection
 # =============================================================================
 
