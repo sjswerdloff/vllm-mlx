@@ -5,24 +5,24 @@ Batched engine for continuous batching with multiple concurrent users.
 This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 
-For MLLM models, this engine supports a hybrid approach:
-- Text-only requests: Use BatchGenerator for continuous batching
-- Multimodal requests (with images/videos): Fall back to MLLM.chat() for correct processing
-
-This is necessary because BatchGenerator only supports token IDs, not pixel_values.
+For MLLM models, all requests (text-only and multimodal) are routed through
+the MLLMScheduler, which handles vision encoding and batched generation via
+MLLMBatchGenerator. MLLM models only initialise the MLLM scheduler (not the
+LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
-from .base import BaseEngine, GenerationOutput
-from ..api.utils import is_mllm_model, clean_output_text, extract_multimodal_content
 from ..api.tool_calling import convert_tools_for_template
+from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_media_from_messages(messages: List[Dict[str, Any]]) -> tuple:
+def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
     """
     Extract images and videos from OpenAI-format messages.
 
@@ -134,7 +134,7 @@ class BatchedEngine(BaseEngine):
         self,
         model_name: str,
         trust_remote_code: bool = True,
-        scheduler_config: Optional[Any] = None,
+        scheduler_config: Any | None = None,
         stream_interval: int = 1,
         force_mllm: bool = False,
     ):
@@ -194,8 +194,8 @@ class BatchedEngine(BaseEngine):
 
     async def _start_mllm(self) -> None:
         """Start the MLLM engine with MLLMScheduler (continuous batching)."""
-        from ..models.mllm import MLXMultimodalLM
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from ..models.mllm import MLXMultimodalLM
 
         # Load the MLLM model
         self._mllm_instance = MLXMultimodalLM(
@@ -243,7 +243,7 @@ class BatchedEngine(BaseEngine):
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
-        from ..engine_core import EngineConfig, AsyncEngineCore
+        from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
         from ..utils.tokenizer import load_model_with_fallback
 
@@ -258,6 +258,42 @@ class BatchedEngine(BaseEngine):
             self._model_name,
             tokenizer_config=tokenizer_config,
         )
+
+        # Validate MTP support if enabled
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..patches.qwen3_next_mtp import validate_mtp_support
+
+            if validate_mtp_support(self._model):
+                logger.info("[MTP] Model validated for MTP speculative decoding")
+            else:
+                logger.warning(
+                    "[MTP] MTP validation failed — --enable-mtp will be ignored. "
+                    "See warnings above for details."
+                )
+
+        # Set Metal memory limits to make allocation failures graceful
+        # instead of fatal Metal command buffer errors (SIGABRT)
+        try:
+            import mlx.core as mx
+
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                max_recommended = device_info.get(
+                    "max_recommended_working_set_size",
+                    device_info.get("memory_size", 0),
+                )
+                if max_recommended > 0:
+                    soft_limit = int(max_recommended * 0.90)
+                    mx.set_memory_limit(soft_limit)
+                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    logger.info(
+                        f"Metal memory limits set: "
+                        f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                        f"(90% of {max_recommended / 1e9:.1f}GB), "
+                        f"cache_limit=32GB"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to set Metal memory limits: {e}")
 
         # Create engine config
         scheduler_config = self._scheduler_config or SchedulerConfig()
@@ -288,7 +324,6 @@ class BatchedEngine(BaseEngine):
             self._engine = None
 
         self._model = None
-        self._mllm = None
         self._tokenizer = None
         self._processor = None
         self._mllm_instance = None
@@ -297,72 +332,96 @@ class BatchedEngine(BaseEngine):
 
     def _apply_chat_template(
         self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[dict]] = None,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
         num_images: int = 0,
     ) -> str:
-        """Apply chat template to messages."""
-        tokenizer = self.tokenizer
+        """Apply chat template to messages.
 
-        if self._is_mllm and self._processor:
-            # Use mlx_vlm's chat template for MLLM
-            try:
-                from mlx_vlm.prompt_utils import apply_chat_template
-                from mlx_vlm.utils import load_config
+        Uses the processor's (or tokenizer's) apply_chat_template with the
+        full message list so that system prompts and conversation history
+        are preserved. The previous implementation extracted only the last
+        user message text via mlx_vlm.prompt_utils.apply_chat_template,
+        which dropped system prompts and all prior turns.
+        """
+        # Choose the best template applicator.
+        # For MLLM models, the processor handles special vision tokens.
+        # For text-only models, the tokenizer is sufficient.
+        template_applicator = None
+        if (
+            self._is_mllm
+            and self._processor
+            and hasattr(self._processor, "apply_chat_template")
+        ):
+            template_applicator = self._processor
+        elif hasattr(self.tokenizer, "apply_chat_template"):
+            template_applicator = self.tokenizer
 
-                config = getattr(self._model, "config", None)
-                if config is None:
-                    config = load_config(self._model_name)
+        if template_applicator is not None:
+            # Convert OpenAI image_url content parts to HuggingFace format
+            # so the processor can insert the correct vision placeholder tokens.
+            if self._is_mllm and num_images > 0:
+                messages = self._prepare_mllm_messages(messages)
 
-                # Extract text from last user message
-                text_prompt = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            text_prompt = content
-                        elif isinstance(content, list):
-                            for item in content:
-                                if isinstance(item, str):
-                                    text_prompt = item
-                                    break
-                                elif (
-                                    isinstance(item, dict)
-                                    and item.get("type") == "text"
-                                ):
-                                    text_prompt = item.get("text", "")
-                                    break
-                        break
-
-                return apply_chat_template(
-                    self._processor,
-                    config,
-                    text_prompt,
-                    num_images=num_images,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to apply MLLM chat template: {e}")
-                # Fall through to standard template
-
-        if hasattr(tokenizer, "apply_chat_template"):
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
-                "enable_thinking": True,
             }
             if tools:
                 template_kwargs["tools"] = tools
 
             try:
-                return tokenizer.apply_chat_template(messages, **template_kwargs)
-            except TypeError:
-                for key in ["tools", "enable_thinking"]:
+                return template_applicator.apply_chat_template(
+                    messages, **template_kwargs
+                )
+            except TypeError as e:
+                # Some templates don't accept 'tools'; retry without them.
+                logger.debug(f"Chat template TypeError, retrying without extras: {e}")
+                for key in ["tools"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
-                return tokenizer.apply_chat_template(messages, **template_kwargs)
+                return template_applicator.apply_chat_template(
+                    messages, **template_kwargs
+                )
         else:
+            # Fallback for models without apply_chat_template
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
+
+    @staticmethod
+    def _prepare_mllm_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Convert OpenAI-style image_url content to HuggingFace format.
+
+        The OpenAI API uses ``{"type": "image_url", "image_url": {"url": ...}}``
+        while HuggingFace processors expect ``{"type": "image"}``.
+
+        Args:
+            messages: List of chat messages in OpenAI format. Each message is a
+                dict with at least ``role`` and ``content`` keys.
+
+        Returns:
+            A new list of messages with ``image_url`` parts replaced by
+            ``{"type": "image"}`` entries for the HuggingFace processor.
+        """
+        prepared = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        new_content.append({"type": "image"})
+                    elif isinstance(part, (dict, str)):
+                        new_content.append(part)
+                    # skip non-dict/non-str parts to avoid passing unexpected types
+                prepared.append({**msg, "content": new_content})
+            else:
+                prepared.append(msg)
+        return prepared
 
     async def generate(
         self,
@@ -370,9 +429,9 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -394,8 +453,10 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests when model is multimodal.
+            # MLLM models only initialise the _mllm_scheduler (not _engine),
+            # so text-only requests must also be routed here.
             output = await self._mllm_scheduler.generate(
                 prompt=prompt,
                 images=images,
@@ -412,7 +473,7 @@ class BatchedEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
 
-        # Use LLM engine for text-only
+        # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -442,9 +503,9 @@ class BatchedEngine(BaseEngine):
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -466,8 +527,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        if self._is_mllm and self._mllm_scheduler and (images or videos):
-            # Use MLLM scheduler for multimodal streaming
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
                 prompt=prompt,
                 images=images,
@@ -498,9 +559,11 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
         )
 
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -517,21 +580,21 @@ class BatchedEngine(BaseEngine):
 
     async def chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
         Chat completion (non-streaming).
 
-        For MLLM models with images/videos, uses the native MLLM.chat() method
-        which properly processes multimodal content through the vision encoder.
-        For text-only requests, uses BatchGenerator for continuous batching.
+        For MLLM models, all requests (including text-only) are routed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
 
         Args:
             messages: List of chat messages (OpenAI format)
@@ -550,6 +613,7 @@ class BatchedEngine(BaseEngine):
             await self.start()
 
         # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -574,23 +638,74 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         )
 
+    def _compute_prefix_boundary(
+        self, messages: list[dict[str, Any]], tools: list[dict] | None = None
+    ) -> int:
+        """Compute token count for the shared prefix across message variations.
+
+        Uses a two-tokenization approach: tokenize the full prompt twice
+        (once as-is, once with the last user message replaced by a dummy)
+        and find the longest common prefix (LCP).  This gives the exact
+        boundary where different user suffixes diverge, avoiding template
+        discrepancies (e.g. Qwen3 <think> markers on last assistant).
+        """
+        # Find index of last user message
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None or last_user_idx == 0:
+            return 0
+        try:
+            template_tools = convert_tools_for_template(tools) if tools else None
+
+            # Tokenize the real prompt
+            real_prompt = self._apply_chat_template(messages, template_tools)
+
+            # Build a dummy variant with different last user content
+            dummy_messages = list(messages)
+            dummy_messages[last_user_idx] = {
+                **messages[last_user_idx],
+                "content": "XXXXXXXXXX",
+            }
+            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+
+            real_tokens = tokenizer.encode(real_prompt)
+            dummy_tokens = tokenizer.encode(dummy_prompt)
+
+            # Find LCP — the point where the two diverge is the boundary
+            lcp = 0
+            for j in range(min(len(real_tokens), len(dummy_tokens))):
+                if real_tokens[j] != dummy_tokens[j]:
+                    break
+                lcp = j + 1
+
+            return lcp
+        except Exception:
+            return 0
+
     async def stream_chat(
         self,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        tools: Optional[List[dict]] = None,
-        images: Optional[List[str]] = None,
-        videos: Optional[List[str]] = None,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
         Stream chat completion token by token.
 
-        For MLLM models with images/videos, uses the native MLLM.stream_chat() method
-        which properly processes multimodal content through the vision encoder.
-        For text-only requests, uses BatchGenerator for continuous batching.
+        For MLLM models, all requests (including text-only) are streamed through
+        the MLLMScheduler for vision-aware batched generation.
+        For non-MLLM models, uses the LLM engine with BatchGenerator.
 
         Args:
             messages: List of chat messages (OpenAI format)
@@ -609,6 +724,7 @@ class BatchedEngine(BaseEngine):
             await self.start()
 
         # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
         _, extracted_images, extracted_videos = extract_multimodal_content(messages)
         all_images = (images or []) + extracted_images
         all_videos = (videos or []) + extracted_videos
@@ -623,6 +739,11 @@ class BatchedEngine(BaseEngine):
             num_images=len(all_images),
         )
 
+        # Compute prefix boundary for cache
+        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
+
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -634,7 +755,7 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         stats = {
             "engine_type": "batched",
@@ -645,16 +766,37 @@ class BatchedEngine(BaseEngine):
         }
 
         if self._mllm_scheduler:
-            stats["mllm_scheduler"] = self._mllm_scheduler.get_stats()
+            mllm_stats = self._mllm_scheduler.get_stats()
+            stats["mllm_scheduler"] = mllm_stats
+            # Promote Metal memory stats to top-level for /v1/status
+            for key in (
+                "metal_active_memory_gb",
+                "metal_peak_memory_gb",
+                "metal_cache_memory_gb",
+            ):
+                if key in mllm_stats:
+                    stats[key] = mllm_stats[key]
         elif self._engine:
             stats.update(self._engine.get_stats())
 
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self._mllm_scheduler and self._mllm_scheduler.vision_cache:
             return self._mllm_scheduler.vision_cache.get_stats()
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk for persistence across restarts."""
+        if self._engine:
+            return self._engine.save_cache_to_disk(cache_dir)
+        return False
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded."""
+        if self._engine:
+            return self._engine.load_cache_from_disk(cache_dir)
+        return 0

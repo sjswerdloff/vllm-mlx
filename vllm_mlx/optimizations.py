@@ -86,7 +86,7 @@ def get_system_memory_gb() -> float:
     except Exception:
         # Fallback: try to get from MLX device info
         try:
-            device_info = mx.metal.device_info()
+            device_info = mx.device_info()
             if "memory_size" in device_info:
                 return device_info["memory_size"] / (1024**3)
         except Exception:
@@ -105,7 +105,7 @@ def detect_hardware() -> HardwareInfo:
         HardwareInfo with detected hardware specifications
     """
     try:
-        device_info = mx.metal.device_info()
+        device_info = mx.device_info()
         device_name = device_info.get("device_name", "")
         actual_memory_gb = get_system_memory_gb()
 
@@ -150,7 +150,7 @@ def benchmark_memory_bandwidth() -> dict:
     """
     import time
 
-    sizes_mb = [64, 256, 1024]
+    sizes_mb = [1, 4, 16]
     results = {}
 
     for size_mb in sizes_mb:
@@ -182,7 +182,7 @@ def get_optimization_status() -> dict:
         dict with hardware info and MLX configuration
     """
     hw = detect_hardware()
-    device_info = mx.metal.device_info()
+    device_info = mx.device_info()
     flash_available = hasattr(mx, "fast") and hasattr(
         mx.fast, "scaled_dot_product_attention"
     )

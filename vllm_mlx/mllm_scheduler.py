@@ -22,6 +22,8 @@ import asyncio
 import logging
 import time
 import uuid
+
+import mlx.core as mx
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
@@ -45,10 +47,9 @@ class MLLMSchedulerConfig:
 
     # Maximum concurrent MLLM requests in the batch
     max_num_seqs: int = 16
-    # Prefill batch size - set equal to max_num_seqs to avoid batch extend issues
-    # (VLM KV cache transfer between batches is complex and model-specific)
+    # Prefill batch size (all queued requests are prefilled together)
     prefill_batch_size: int = 16
-    # Completion batch size (same as prefill for consistency)
+    # Completion batch size
     completion_batch_size: int = 16
     # Prefill step size for chunked prefill
     prefill_step_size: int = 1024
@@ -204,6 +205,10 @@ class MLLMScheduler:
         self._running = False
         self._processing_task: Optional[asyncio.Task] = None
 
+        # Memory management: periodic mx.clear_cache() to free Metal buffer pool
+        self._step_count = 0
+        self._clear_cache_interval = 32
+
         # Statistics
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
@@ -343,6 +348,7 @@ class MLLMScheduler:
         # Mark as aborted
         request.status = RequestStatus.FINISHED_ABORTED
         self.finished_req_ids.add(request_id)
+        self.requests.pop(request_id, None)
 
         # Signal output queue
         if request_id in self.output_queues:
@@ -502,6 +508,7 @@ class MLLMScheduler:
 
             # Track as finished
             self.finished_req_ids.add(request_id)
+            self.requests.pop(request_id, None)
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -544,6 +551,20 @@ class MLLMScheduler:
                             pass
 
                 self._cleanup_finished(finished_ids)
+                if finished_ids:
+                    mx.clear_cache()
+
+        # Adaptive periodic cache clear: scale inversely with concurrency
+        # to prevent Metal buffer pool growth during long generations
+        active_seqs = len(self.running)
+        min_interval = max(4, self._clear_cache_interval // 4)
+        effective_interval = max(
+            min_interval, self._clear_cache_interval // max(1, active_seqs // 8)
+        )
+
+        self._step_count += 1
+        if self._step_count % effective_interval == 0:
+            mx.clear_cache()
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
@@ -663,15 +684,24 @@ class MLLMScheduler:
         if output_queue is None:
             return
 
-        while True:
-            output = await output_queue.get()
-            if output is None:
-                break
-            yield output
-
-        # Cleanup queue
-        if request_id in self.output_queues:
-            del self.output_queues[request_id]
+        finished_normally = False
+        try:
+            while True:
+                output = await output_queue.get()
+                if output is None:
+                    finished_normally = True
+                    break
+                yield output
+                if output.finished:
+                    finished_normally = True
+                    break
+        finally:
+            if not finished_normally:
+                logger.info(f"Aborting orphaned MLLM request {request_id}")
+                self.abort_request(request_id)
+            # Cleanup queue
+            if request_id in self.output_queues:
+                del self.output_queues[request_id]
 
     async def generate(
         self,
@@ -744,6 +774,15 @@ class MLLMScheduler:
 
         if self.vision_cache:
             stats["vision_cache"] = self.vision_cache.get_stats()
+
+        # Include Metal memory stats
+        try:
+            if mx.metal.is_available():
+                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
+                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
+                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+        except Exception:
+            pass
 
         return stats
 

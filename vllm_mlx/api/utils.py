@@ -4,7 +4,6 @@ Utility functions for text processing and model detection.
 """
 
 import re
-from typing import List, Tuple
 
 from .models import Message
 
@@ -17,8 +16,54 @@ from .models import Message
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
+    r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]"
 )
+
+
+# Regex for matching final channel marker with optional constrain token:
+#   <|channel|>final<|message|>
+#   <|channel|>final <|constrain|>JSON<|message|>
+_FINAL_CHANNEL_RE = re.compile(
+    r"<\|channel\|>final[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>"
+)
+
+
+def _clean_gpt_oss_output(text: str) -> str:
+    """
+    Extract final channel content from GPT-OSS channel-based output.
+
+    When reasoning parser is not enabled, this provides a fallback that
+    extracts the 'final' channel content so the API response is usable.
+
+    Handles both standard and extended format with constrain token:
+        <|channel|>final<|message|>...
+        <|channel|>final <|constrain|>JSON<|message|>...
+
+    Args:
+        text: Raw model output containing channel tokens.
+
+    Returns:
+        Extracted final content, or text with channel tokens stripped.
+    """
+    match = _FINAL_CHANNEL_RE.search(text)
+    if match:
+        content = text[match.end() :]
+        # Strip trailing structural tokens (including <|constrain|>)
+        content = re.sub(
+            r"<\|start\|>|<\|end\|>|<\|channel\|>|<\|return\|>|<\|call\|>|<\|message\|>|<\|constrain\|>",
+            "",
+            content,
+        )
+        return content.strip()
+
+    # No final channel — strip all channel/structural tokens (including constrain)
+    cleaned = re.sub(
+        r"<\|channel\|>[^<]*(?:<\|constrain\|>[^<]*)?<\|message\|>|<\|start\|>[^<]*|<\|return\|>|<\|call\|>|<\|constrain\|>[^<]*",
+        "",
+        text,
+    )
+    return cleaned.strip()
 
 
 def clean_output_text(text: str) -> str:
@@ -28,6 +73,8 @@ def clean_output_text(text: str) -> str:
     Keeps <think>...</think> blocks intact for reasoning models.
     Adds opening <think> tag if missing (happens when thinking is enabled
     in the prompt template but the tag is part of the prompt, not output).
+    Handles GPT-OSS channel-based format as fallback when reasoning parser
+    is not enabled.
 
     Args:
         text: Raw model output
@@ -37,6 +84,12 @@ def clean_output_text(text: str) -> str:
     """
     if not text:
         return text
+
+    # GPT-OSS channel format — extract final content before general stripping
+    if "<|channel|>" in text and "<|message|>" in text:
+        text = _clean_gpt_oss_output(text)
+        return text
+
     text = SPECIAL_TOKENS_PATTERN.sub("", text)
     text = text.strip()
 
@@ -108,9 +161,29 @@ is_vlm_model = is_mllm_model
 # =============================================================================
 
 
+def _content_to_text(content) -> str:
+    """Extract text from content that can be str, list[ContentPart], or None."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            elif hasattr(item, "dict"):
+                item = item.dict()
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
 def extract_multimodal_content(
-    messages: List[Message],
-) -> Tuple[List[dict], List[str], List[str]]:
+    messages: list[Message],
+    preserve_native_format: bool = False,
+) -> tuple[list[dict], list[str], list[str]]:
     """
     Extract text content, images, and videos from OpenAI-format messages.
 
@@ -122,6 +195,10 @@ def extract_multimodal_content(
 
     Args:
         messages: List of Message objects
+        preserve_native_format: If True, preserve native tool message format
+            (role="tool", tool_calls field) instead of converting to text.
+            Required for models with native tool support in chat templates
+            (e.g., Mistral, Llama 3+, DeepSeek V3).
 
     Returns:
         Tuple of (processed_messages, images, videos)
@@ -144,18 +221,29 @@ def extract_multimodal_content(
 
         # Handle tool response messages (role="tool")
         if role == "tool":
-            # Format tool result as assistant context
             if isinstance(msg, dict):
                 tool_call_id = msg.get("tool_call_id", "") or ""
             else:
                 tool_call_id = getattr(msg, "tool_call_id", None) or ""
             tool_content = content if content else ""
-            processed_messages.append(
-                {
-                    "role": "user",  # mlx-lm expects user/assistant roles
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
-                }
-            )
+
+            if preserve_native_format:
+                # Preserve native tool format for models that support it
+                processed_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }
+                )
+            else:
+                # Convert to user role for models without native support
+                processed_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                    }
+                )
             continue
 
         # Handle assistant messages with tool_calls
@@ -165,20 +253,53 @@ def extract_multimodal_content(
             tool_calls = getattr(msg, "tool_calls", None)
 
         if role == "assistant" and tool_calls:
-            # Format tool calls as part of the assistant message
-            tool_calls_text = []
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    func = tc.get("function", {})
-                    name = func.get("name", "unknown")
-                    args = func.get("arguments", "{}")
-                    tool_calls_text.append(f"[Calling tool: {name}({args})]")
+            if preserve_native_format:
+                # Preserve native tool_calls format
+                tool_calls_list = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_copy = tc
+                    elif hasattr(tc, "model_dump"):
+                        tc_copy = tc.model_dump()
+                    elif hasattr(tc, "dict"):
+                        tc_copy = tc.dict()
+                    else:
+                        continue
 
-            text = content if content else ""
-            if tool_calls_text:
-                text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+                    # Chat templates (e.g. Qwen3) iterate arguments|items,
+                    # but OpenAI API sends arguments as a JSON string.
+                    # Parse it into a dict so the template can iterate it.
+                    func = tc_copy.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            import json
 
-            processed_messages.append({"role": role, "content": text})
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                    tool_calls_list.append(tc_copy)
+
+                msg_dict = {"role": role, "content": _content_to_text(content)}
+                if tool_calls_list:
+                    msg_dict["tool_calls"] = tool_calls_list
+                processed_messages.append(msg_dict)
+            else:
+                # Convert tool calls to text for models without native support
+                tool_calls_text = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        func = tc.get("function", {})
+                        name = func.get("name", "unknown")
+                        args = func.get("arguments", "{}")
+                        tool_calls_text.append(f"[Calling tool: {name}({args})]")
+
+                text = _content_to_text(content)
+                if tool_calls_text:
+                    text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
+
+                processed_messages.append({"role": role, "content": text})
             continue
 
         # Handle None content

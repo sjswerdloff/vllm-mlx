@@ -15,6 +15,7 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **[mlx-lm](https://github.com/ml-explore/mlx-lm)**: Optimized LLM inference with KV cache and quantization
 - **[mlx-vlm](https://github.com/Blaizzy/mlx-vlm)**: Vision-language models for multimodal inference
 - **[mlx-audio](https://github.com/Blaizzy/mlx-audio)**: Speech-to-Text and Text-to-Speech with native voices
+- **[mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings)**: Text embeddings for semantic search and RAG
 
 ## Features
 
@@ -22,6 +23,9 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 - **Native GPU acceleration** on Apple Silicon (M1, M2, M3, M4)
 - **Native TTS voices** - Spanish, French, Chinese, Japanese + 5 more languages
 - **OpenAI API compatible** - drop-in replacement for OpenAI client
+- **Anthropic Messages API** - native `/v1/messages` endpoint for Claude Code and OpenCode
+- **Embeddings** - OpenAI-compatible `/v1/embeddings` endpoint with mlx-embeddings
+- **Reasoning Models** - extract thinking process from Qwen3, DeepSeek-R1
 - **MCP Tool Calling** - integrate external tools via Model Context Protocol
 - **Paged KV Cache** - memory-efficient caching with prefix sharing
 - **Continuous Batching** - high throughput for multiple concurrent users
@@ -30,7 +34,23 @@ vllm-mlx brings native Apple Silicon GPU acceleration to vLLM by integrating:
 
 ### Installation
 
+**Using uv (recommended):**
+
 ```bash
+# Install as CLI tool (system-wide)
+uv tool install git+https://github.com/waybarrios/vllm-mlx.git
+
+# Or install in a project/virtual environment
+uv pip install git+https://github.com/waybarrios/vllm-mlx.git
+```
+
+**Using pip:**
+
+```bash
+# Install from GitHub
+pip install git+https://github.com/waybarrios/vllm-mlx.git
+
+# Or clone and install in development mode
 git clone https://github.com/waybarrios/vllm-mlx.git
 cd vllm-mlx
 pip install -e .
@@ -66,6 +86,33 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Use with Anthropic SDK
+
+vllm-mlx exposes an Anthropic-compatible `/v1/messages` endpoint, so tools like Claude Code and OpenCode can connect directly.
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://localhost:8000", api_key="not-needed")
+
+response = client.messages.create(
+    model="default",
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.content[0].text)
+```
+
+To use with Claude Code:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=not-needed
+claude
+```
+
+See [Anthropic Messages API docs](docs/guides/server.md#anthropic-messages-api) for streaming, tool calling, system messages, and token counting.
 
 ### Multimodal (Images & Video)
 
@@ -115,6 +162,52 @@ python examples/tts_multilingual.py --list-languages
 | VibeVoice | EN | Realtime, low latency |
 | VoxCPM | ZH, EN | High quality Chinese/English |
 
+### Reasoning Models
+
+Extract the thinking process from reasoning models like Qwen3 and DeepSeek-R1:
+
+```bash
+# Start server with reasoning parser
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --reasoning-parser qwen3
+```
+
+```python
+response = client.chat.completions.create(
+    model="default",
+    messages=[{"role": "user", "content": "What is 17 × 23?"}]
+)
+
+# Access reasoning separately from the answer
+print("Thinking:", response.choices[0].message.reasoning)
+print("Answer:", response.choices[0].message.content)
+```
+
+**Supported Parsers:**
+| Parser | Models | Description |
+|--------|--------|-------------|
+| `qwen3` | Qwen3 series | Requires both `<think>` and `</think>` tags |
+| `deepseek_r1` | DeepSeek-R1 | Handles implicit `<think>` tag |
+
+### Embeddings
+
+Generate text embeddings for semantic search, RAG, and similarity:
+
+```bash
+# Start server with an embedding model pre-loaded
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --embedding-model mlx-community/all-MiniLM-L6-v2-4bit
+```
+
+```python
+# Generate embeddings using the OpenAI SDK
+embeddings = client.embeddings.create(
+    model="mlx-community/all-MiniLM-L6-v2-4bit",
+    input=["Hello world", "How are you?"]
+)
+print(f"Dimensions: {len(embeddings.data[0].embedding)}")
+```
+
+See [Embeddings Guide](docs/guides/embeddings.md) for details on supported models and lazy loading.
+
 ## Documentation
 
 For full documentation, see the [docs](docs/) directory:
@@ -125,9 +218,12 @@ For full documentation, see the [docs](docs/) directory:
 
 - **User Guides**
   - [OpenAI-Compatible Server](docs/guides/server.md)
+  - [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api)
   - [Python API](docs/guides/python-api.md)
   - [Multimodal (Images & Video)](docs/guides/multimodal.md)
   - [Audio (STT/TTS)](docs/guides/audio.md)
+  - [Embeddings](docs/guides/embeddings.md)
+  - [Reasoning Models](docs/guides/reasoning.md)
   - [MCP & Tool Calling](docs/guides/mcp-tools.md)
   - [Continuous Batching](docs/guides/continuous-batching.md)
 
@@ -145,31 +241,31 @@ For full documentation, see the [docs](docs/) directory:
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    vLLM API Layer                       │
-│           (OpenAI-compatible interface)                 │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│                    MLXPlatform                          │
-│       (vLLM platform plugin for Apple Silicon)          │
-└─────────────────────────────────────────────────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-┌──────────────────┐ ┌──────────────┐ ┌──────────────────┐
-│     mlx-lm       │ │   mlx-vlm    │ │    mlx-audio     │
-│  (LLM inference) │ │ (Vision+LLM) │ │   (TTS + STT)    │
-└──────────────────┘ └──────────────┘ └──────────────────┘
-          │                │                  │
-          └────────────────┴──────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│                        MLX                              │
-│         (Apple ML Framework - Metal kernels)            │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           vLLM API Layer                                │
+│                    (OpenAI-compatible interface)                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            MLXPlatform                                  │
+│               (vLLM platform plugin for Apple Silicon)                  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+        ┌─────────────┬────────────┴────────────┬─────────────┐
+        ▼             ▼                         ▼             ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│    mlx-lm     │ │   mlx-vlm     │ │   mlx-audio   │ │mlx-embeddings │
+│(LLM inference)│ │ (Vision+LLM)  │ │  (TTS + STT)  │ │ (Embeddings)  │
+└───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘
+        │             │                         │             │
+        └─────────────┴─────────────────────────┴─────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              MLX                                        │
+│                (Apple ML Framework - Metal kernels)                      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Performance
@@ -203,7 +299,7 @@ See [benchmarks](docs/benchmarks/) for detailed results.
 
 ## Gemma 3 Support
 
-This fork includes patches for Gemma 3 vision support. Gemma 3 is a multimodal model but requires detection as MLLM.
+vllm-mlx includes native support for Gemma 3 vision models. Gemma 3 is automatically detected as MLLM.
 
 ### Usage
 
@@ -301,4 +397,5 @@ If you use vLLM-MLX in your research or project, please cite:
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) - LLM inference library
 - [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) - Text-to-Speech and Speech-to-Text
+- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Text embeddings
 - [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM serving
