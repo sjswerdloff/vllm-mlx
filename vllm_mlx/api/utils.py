@@ -111,6 +111,7 @@ def clean_output_text(text: str) -> str:
 _TOOL_CALL_TAGS = [
     ("<minimax:tool_call>", "</minimax:tool_call>"),
     ("<tool_call>", "</tool_call>"),
+    ("[Calling tool:", ")]"),
 ]
 
 
