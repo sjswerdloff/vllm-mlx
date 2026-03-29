@@ -62,6 +62,7 @@ from .utils import (
     MLLM_PATTERNS,
     SPECIAL_TOKENS_PATTERN,
     StreamingToolCallFilter,
+    StreamingThinkRouter,
 )
 
 from .tool_calling import (
@@ -120,6 +121,7 @@ __all__ = [
     "MLLM_PATTERNS",
     "SPECIAL_TOKENS_PATTERN",
     "StreamingToolCallFilter",
+    "StreamingThinkRouter",
     # Tool calling
     "parse_tool_calls",
     "convert_tools_for_template",

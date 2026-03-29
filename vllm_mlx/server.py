@@ -99,6 +99,7 @@ from .api.tool_calling import (
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
     StreamingToolCallFilter,
+    StreamingThinkRouter,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -1780,22 +1781,17 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Emit content_block_start for text
-    content_block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
-
-    # Stream content deltas
-    # StreamingToolCallFilter suppresses tool call XML markup during streaming.
-    # Without this, <minimax:tool_call> content leaks into text deltas and
-    # appears in the client's context alongside the structured tool_use block,
-    # doubling token consumption for every tool call.
+    # Stream pipeline: raw text → tool call filter → think router → emit
+    # - Tool call filter strips tool call markup (emitted as structured blocks later)
+    # - Think router separates <think> content into Anthropic thinking blocks
     accumulated_text = ""
     tool_filter = StreamingToolCallFilter()
+    think_router = StreamingThinkRouter()
     completion_tokens = 0
+
+    # Track which content blocks we've started
+    current_block_type = None  # "thinking" or "text"
+    block_index = 0
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
@@ -1810,36 +1806,76 @@ async def _stream_anthropic_messages(
 
             if content:
                 accumulated_text += content
-                # Filter out tool call markup before emitting to client
+                # Stage 1: strip tool call markup
                 filtered = tool_filter.process(content)
-                if filtered:
-                    delta_event = {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": filtered},
-                    }
+                if not filtered:
+                    continue
+                # Stage 2: route thinking vs text
+                pieces = think_router.process(filtered)
+                for block_type, text in pieces:
+                    if block_type != current_block_type:
+                        # Close previous block if open
+                        if current_block_type is not None:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                            block_index += 1
+                        # Start new block
+                        current_block_type = block_type
+                        content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
+                    # Emit delta
+                    if block_type == "thinking":
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "thinking_delta", "thinking": text},
+                        }
+                    else:
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "text_delta", "text": text},
+                        }
                     yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
-    # Flush any remaining buffered text
+    # Flush remaining from both filters
     remaining = tool_filter.flush()
     if remaining:
-        delta_event = {
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "text_delta", "text": remaining},
-        }
-        yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+        for block_type, text in think_router.process(remaining):
+            if block_type != current_block_type:
+                if current_block_type is not None:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                    block_index += 1
+                current_block_type = block_type
+                content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
+            delta_key = "thinking" if block_type == "thinking" else "text"
+            delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+
+    for block_type, text in think_router.flush():
+        if block_type != current_block_type:
+            if current_block_type is not None:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                block_index += 1
+            current_block_type = block_type
+            content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
+        delta_key = "thinking" if block_type == "thinking" else "text"
+        delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
+        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+
+    # Close final content block
+    if current_block_type is not None:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+        block_index += 1
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
-    # Emit content_block_stop for text block
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
     # If there are tool calls, emit tool_use blocks
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = i + 1
+            tool_index = block_index + i
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):

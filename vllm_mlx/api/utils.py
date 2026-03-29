@@ -208,6 +208,99 @@ class StreamingToolCallFilter:
 
 
 # =============================================================================
+# Streaming Think Block Router
+# =============================================================================
+
+
+class StreamingThinkRouter:
+    """Route <think>...</think> content to separate Anthropic thinking blocks.
+
+    Instead of emitting thinking content as plain text (where it's
+    indistinguishable from the response), this router yields tagged
+    pieces that the streaming handler can emit as proper Anthropic
+    content block types.
+
+    Each call to process() returns a list of (block_type, text) tuples:
+    - ("thinking", text) for content inside <think>...</think>
+    - ("text", text) for content outside think blocks
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_think = False
+
+    def process(self, delta: str) -> list[tuple[str, str]]:
+        """Process a delta. Returns list of (block_type, text) pieces."""
+        self._buffer += delta
+        pieces = []
+        self._extract_pieces(pieces)
+        return pieces
+
+    def _extract_pieces(self, pieces: list[tuple[str, str]]) -> None:
+        """Extract all complete pieces from the buffer."""
+        while True:
+            if self._in_think:
+                idx = self._buffer.find("</think>")
+                if idx >= 0:
+                    # Emit thinking content, exit think mode
+                    thinking = self._buffer[:idx]
+                    self._buffer = self._buffer[idx + len("</think>"):]
+                    self._in_think = False
+                    if thinking:
+                        pieces.append(("thinking", thinking))
+                    continue  # Process remainder
+                else:
+                    # Check for partial close tag at end
+                    for plen in range(min(len("</think>"), len(self._buffer)), 0, -1):
+                        if self._buffer.endswith("</think>"[:plen]):
+                            # Hold back partial match
+                            emit = self._buffer[:-plen]
+                            self._buffer = self._buffer[-plen:]
+                            if emit:
+                                pieces.append(("thinking", emit))
+                            return
+                    # No partial match - emit all as thinking
+                    if self._buffer:
+                        pieces.append(("thinking", self._buffer))
+                        self._buffer = ""
+                    return
+            else:
+                idx = self._buffer.find("<think>")
+                if idx >= 0:
+                    # Emit text before tag, enter think mode
+                    before = self._buffer[:idx]
+                    self._buffer = self._buffer[idx + len("<think>"):]
+                    self._in_think = True
+                    if before:
+                        pieces.append(("text", before))
+                    continue  # Process remainder
+                else:
+                    # Check for partial open tag at end
+                    for plen in range(min(len("<think>"), len(self._buffer)), 0, -1):
+                        if self._buffer.endswith("<think>"[:plen]):
+                            emit = self._buffer[:-plen]
+                            self._buffer = self._buffer[-plen:]
+                            if emit:
+                                pieces.append(("text", emit))
+                            return
+                    # No partial match - emit all as text
+                    if self._buffer:
+                        pieces.append(("text", self._buffer))
+                        self._buffer = ""
+                    return
+
+    def flush(self) -> list[tuple[str, str]]:
+        """Flush remaining buffer at end of stream."""
+        pieces = []
+        if self._buffer:
+            block_type = "thinking" if self._in_think else "text"
+            pieces.append((block_type, self._buffer))
+            self._buffer = ""
+        self._in_think = False
+        return pieces
+
+
+# =============================================================================
 # Model Detection
 # =============================================================================
 
