@@ -385,14 +385,14 @@ def _install_chunked_prefill(
                     else:
                         mx.clear_cache()
 
-                    (
-                        uids,
-                        inputs_raw,
-                        max_tokens_list,
-                        caches,
-                        samplers,
-                        logits_processors,
-                    ) = zip(*batch_prompts)
+                    # mlx-lm 0.31.1 adds prompt_checkpoints (7th field)
+                    unpacked = list(zip(*batch_prompts))
+                    uids = unpacked[0]
+                    inputs_raw = unpacked[1]
+                    max_tokens_list = unpacked[2]
+                    caches = unpacked[3]
+                    samplers = unpacked[4]
+                    logits_processors = unpacked[5]
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
                     padding = [max_length - ln for ln in lengths]

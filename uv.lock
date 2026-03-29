@@ -2676,6 +2676,21 @@ wheels = [
 ]
 
 [[package]]
+name = "mlx-embeddings"
+version = "0.0.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "mlx" },
+    { name = "mlx-vlm" },
+    { name = "transformers", extra = ["sentencepiece"] },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ef/b8/2f6f9e48386c1ab6fc0431d683296c45eb4bbcc5d3b4b2bf9594746d1efe/mlx_embeddings-0.0.5.tar.gz", hash = "sha256:0bcced68df6fb51ab98cd8ce5ae7a32db3853bca20e8c1c45e86452ed1d9d605", size = 475449, upload-time = "2025-10-29T22:38:28.853Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/66/524db48e1e90ae071589ebcd29cd8e03daa4f69ac63718f0977dac922f0f/mlx_embeddings-0.0.5-py2.py3-none-any.whl", hash = "sha256:3c13eba4c10d26362e6d92f5faffd58d1d9ab28d56f1ee210ea7766c7980c24a", size = 51547, upload-time = "2025-10-29T22:38:27.463Z" },
+]
+
+[[package]]
 name = "mlx-lm"
 version = "0.31.1"
 source = { registry = "https://pypi.org/simple" }
@@ -7292,6 +7307,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/88/ae8320064e32679a5429a2c9ebbc05c2bf32cefb6e076f9b07f6d685a9b4/transformers-5.3.0-py3-none-any.whl", hash = "sha256:50ac8c89c3c7033444fb3f9f53138096b997ebb70d4b5e50a2e810bf12d3d29a", size = 10661827, upload-time = "2026-03-04T17:41:42.722Z" },
 ]
 
+[package.optional-dependencies]
+sentencepiece = [
+    { name = "protobuf" },
+    { name = "sentencepiece" },
+]
+
 [[package]]
 name = "triton"
 version = "2.3.0"
@@ -7631,7 +7652,7 @@ wheels = [
 
 [[package]]
 name = "vllm-mlx"
-version = "0.2.5"
+version = "0.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -7640,6 +7661,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "mcp" },
     { name = "mlx" },
+    { name = "mlx-embeddings" },
     { name = "mlx-lm" },
     { name = "mlx-vlm" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (python_full_version >= '3.14' and sys_platform == 'darwin')" },
@@ -7718,7 +7740,8 @@ requires-dist = [
     { name = "misaki", extras = ["zh", "ja"], marker = "extra == 'audio'", specifier = ">=0.5.0" },
     { name = "mlx", specifier = ">=0.29.0" },
     { name = "mlx-audio", marker = "extra == 'audio'", specifier = ">=0.2.9" },
-    { name = "mlx-lm", specifier = ">=0.30.2" },
+    { name = "mlx-embeddings", specifier = ">=0.0.5" },
+    { name = "mlx-lm", specifier = ">=0.30.5" },
     { name = "mlx-vlm", specifier = ">=0.1.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "num2words", marker = "extra == 'audio'", specifier = ">=0.5.0" },
@@ -7746,7 +7769,7 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.18.0" },
     { name = "torchvision", marker = "extra == 'vision'", specifier = ">=0.18.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
-    { name = "transformers", specifier = ">=4.40.0" },
+    { name = "transformers", specifier = ">=5.0.0" },
     { name = "unidic-lite", marker = "extra == 'audio'", specifier = ">=1.0.0" },
     { name = "uvicorn", specifier = ">=0.23.0" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = ">=0.4.0" },

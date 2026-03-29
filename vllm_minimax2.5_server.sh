@@ -10,7 +10,7 @@ MAX_NUM_SEQS=$(echo "2 * $KINDLED_SUPPORTED" | bc)
 uv run vllm-mlx serve lmstudio-community/MiniMax-M2.5-MLX-8bit \
     --cache-memory-mb "${CACHEMB_TOTAL}" \
     --max-num-seqs "${MAX_NUM_SEQS}" \
-    --max-tokens 200000 \
+    --max-tokens 32768 \
     --continuous-batching \
     --host 0.0.0.0 \
     --port 8899
