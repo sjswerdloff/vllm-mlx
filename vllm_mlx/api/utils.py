@@ -223,11 +223,16 @@ class StreamingThinkRouter:
     Each call to process() returns a list of (block_type, text) tuples:
     - ("thinking", text) for content inside <think>...</think>
     - ("text", text) for content outside think blocks
+
+    Args:
+        start_in_thinking: If True, assume the model starts in thinking
+            mode (e.g. MiniMax adds <think> to the generation prompt,
+            so the tag never appears in the output stream).
     """
 
-    def __init__(self):
+    def __init__(self, start_in_thinking: bool = False):
         self._buffer = ""
-        self._in_think = False
+        self._in_think = start_in_thinking
 
     def process(self, delta: str) -> list[tuple[str, str]]:
         """Process a delta. Returns list of (block_type, text) pieces."""

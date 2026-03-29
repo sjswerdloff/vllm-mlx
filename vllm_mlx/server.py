@@ -1786,7 +1786,15 @@ async def _stream_anthropic_messages(
     # - Think router separates <think> content into Anthropic thinking blocks
     accumulated_text = ""
     tool_filter = StreamingToolCallFilter()
-    think_router = StreamingThinkRouter()
+    # Detect if the model's chat template injects <think> into the
+    # generation prompt. If so, the model starts in thinking mode and
+    # the opening tag never appears in the output stream.
+    _tokenizer = engine.tokenizer if hasattr(engine, 'tokenizer') else None
+    _chat_template = ""
+    if _tokenizer and hasattr(_tokenizer, 'chat_template'):
+        _chat_template = _tokenizer.chat_template or ""
+    _starts_thinking = "<think>" in _chat_template and "add_generation_prompt" in _chat_template
+    think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
     completion_tokens = 0
 
     # Track which content blocks we've started
