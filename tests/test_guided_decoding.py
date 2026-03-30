@@ -104,10 +104,11 @@ class TestFreeTextUnconstrained:
         assert n_allowed == vocab_size, f"Free text restricted to {n_allowed}/{vocab_size}"
 
     def test_minimax_initial_all_allowed(self, minimax_tokenizer) -> None:
-        """MiniMax tokenizer: all 200054 grammar tokens allowed at start."""
+        """MiniMax tokenizer: all tokens allowed at start with real model vocab."""
         processor = create_minimax_tool_processor(minimax_tokenizer)
-        # Use model's actual logit width (200000), not grammar vocab (200054)
-        model_vocab = 200000
+        # Use model's ACTUAL lm_head output width (200064 from config.json),
+        # not tok.vocab_size (200000) or len(tok) (200054)
+        model_vocab = 200064
         logits = mx.zeros((1, model_vocab))
         result = processor(mx.array([0]), logits)
         n_allowed = mx.sum(result[0] > float("-inf")).item()
@@ -128,14 +129,24 @@ class TestVocabSizeMismatch:
         n_allowed = mx.sum(result[0] > float("-inf")).item()
         assert n_allowed == small_vocab
 
-    def test_minimax_vocab_mismatch(self, minimax_tokenizer) -> None:
-        """MiniMax: grammar vocab 200054 but model outputs 200000 logits."""
+    def test_minimax_real_model_vocab(self, minimax_tokenizer) -> None:
+        """MiniMax model config has vocab_size=200064 (padded to 64 boundary).
+
+        Grammar vocab is 200054 (from tokenizer), but the model's lm_head
+        produces 200064-dim logits. The processor must handle this correctly:
+        - Output shape matches input logits shape (200064)
+        - All tokens allowed in free text (including 10 padding positions)
+        - No broadcast errors from the bitmask kernel
+        """
         processor = create_minimax_tool_processor(minimax_tokenizer)
-        model_vocab = 200000
+        model_vocab = 200064  # actual model config vocab_size
         logits = mx.zeros((1, model_vocab))
-        # This would crash with broadcast error if using grammar vocab_size
         result = processor(mx.array([0]), logits)
         assert result.shape == (1, model_vocab)
+        n_allowed = mx.sum(result[0] > float("-inf")).item()
+        assert n_allowed == model_vocab, (
+            f"Expected all {model_vocab} allowed in free text, got {n_allowed}"
+        )
 
 
 class TestPromptTokenHandling:
@@ -232,9 +243,13 @@ class TestEndToEndSimulation:
     """Simulate the full server generation loop offline."""
 
     def test_full_generation_loop_minimax(self, minimax_tokenizer) -> None:
-        """Simulate complete generation: prompt → free text → tool call → close."""
+        """Simulate complete generation: prompt -> free text -> tool call -> close.
+
+        Uses the REAL model vocab size (200064) to catch shape mismatches
+        that wouldn't appear with tok.vocab_size (200000).
+        """
         processor = create_minimax_tool_processor(minimax_tokenizer)
-        model_vocab = 200000
+        model_vocab = 200064  # actual model config vocab_size
 
         # Prompt
         prompt_ids = minimax_tokenizer.encode(
@@ -274,3 +289,42 @@ class TestEndToEndSimulation:
 
         total_generated = len(tokens) - len(prompt_ids)
         assert total_generated > 0, "No tokens generated"
+
+    def test_padding_token_rejection_recovery(self, minimax_tokenizer) -> None:
+        """If model samples a padding token (200054-200063), processor recovers.
+
+        The bitmask has 6252 int32 words = 200064 bits. Positions 200054-200063
+        are padding bits that happen to be set (all-ones). If the model gives
+        these positions high probability, they could be sampled. XGrammar will
+        reject them (out of range), and the processor should reset gracefully.
+        """
+        processor = create_minimax_tool_processor(minimax_tokenizer)
+        model_vocab = 200064
+        grammar_vocab = processor.vocab_size  # 200054
+
+        # Prefill
+        prompt_ids = minimax_tokenizer.encode("Hello")
+        tokens = list(prompt_ids)
+        processor(mx.array(tokens), mx.zeros((1, model_vocab)))
+
+        # Simulate: model sampled a normal token
+        tokens.append(100)
+        result = processor(mx.array(tokens), mx.zeros((1, model_vocab)))
+        n1 = mx.sum(result[0] > float("-inf")).item()
+
+        # Simulate: model sampled a PADDING token (200060)
+        # This is outside grammar vocab [0, 200054) -- XGrammar will reject it
+        tokens.append(200060)
+        result = processor(mx.array(tokens), mx.zeros((1, model_vocab)))
+        # After rejection + reset, grammar should be back to initial state
+        # All tokens should still be allowed
+        n2 = mx.sum(result[0] > float("-inf")).item()
+        assert n2 == model_vocab, (
+            f"After padding token rejection, expected {model_vocab} allowed, got {n2}"
+        )
+
+        # Continue with normal token -- should work fine
+        tokens.append(200)
+        result = processor(mx.array(tokens), mx.zeros((1, model_vocab)))
+        n3 = mx.sum(result[0] > float("-inf")).item()
+        assert n3 == model_vocab, f"Recovery failed: only {n3}/{model_vocab} allowed"
