@@ -65,13 +65,15 @@ class XGrammarLogitsProcessor:
         self.matcher = xgr.GrammarMatcher(compiled_grammar)
         self.vocab_size = vocab_size
         self.bitmask = xgr.allocate_token_bitmask(1, vocab_size)
-        self._first_call = True
+        self._prompt_length = None  # Set on first call to skip prompt tokens
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """Apply grammar constraint to logits.
 
         Args:
-            tokens: All tokens generated so far (prompt + completion)
+            tokens: All tokens so far (prompt + completion). On first call,
+                    these are all prompt tokens. On subsequent calls, the
+                    last token is the most recently generated completion token.
             logits: Raw logits from the model, shape (1, vocab_size)
 
         Returns:
@@ -80,14 +82,19 @@ class XGrammarLogitsProcessor:
         if self.matcher.is_terminated():
             return logits
 
-        # On subsequent calls, accept the last generated token
-        if not self._first_call:
+        if self._prompt_length is None:
+            # First call: tokens are prompt tokens. Record length to skip them.
+            # The grammar starts fresh - it will constrain the FIRST generated token.
+            self._prompt_length = len(tokens)
+        else:
+            # Subsequent calls: accept the last generated token into the grammar
             last_token = tokens[-1].item()
             if not self.matcher.accept_token(last_token):
-                # Token rejected - reset and try to recover
+                # Token rejected by grammar - reset and try to continue
+                logger.warning(
+                    f"[guided_decoding] Token {last_token} rejected by grammar, resetting"
+                )
                 self.matcher.reset()
-                self.matcher.accept_token(last_token)
-        self._first_call = False
 
         if self.matcher.is_terminated():
             return logits
@@ -101,8 +108,10 @@ class XGrammarLogitsProcessor:
         else:
             bitmask_mlx = mx.array(self.bitmask.numpy())
 
-        # Apply bitmask using MLX Metal kernel
-        return apply_token_bitmask_mlx(bitmask_mlx, logits, self.vocab_size)
+        # Use actual logits width, not grammar vocab_size - they can differ
+        # (e.g., MiniMax model outputs 200000 logits but tokenizer has 200054 entries)
+        actual_vocab = logits.shape[-1]
+        return apply_token_bitmask_mlx(bitmask_mlx, logits, actual_vocab)
 
     def reset(self):
         """Reset the processor for a new generation."""
