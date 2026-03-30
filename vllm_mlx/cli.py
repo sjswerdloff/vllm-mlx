@@ -49,6 +49,13 @@ def serve_command(args):
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
 
+    # Validate guided decoding + MTP incompatibility
+    if getattr(args, "guided_decoding_grammar", None) and getattr(args, "enable_mtp", False):
+        print("Error: --guided-decoding-grammar is incompatible with --enable-mtp")
+        print("MTP draft tokens bypass grammar constraints, producing invalid output.")
+        print("Use one or the other, not both.")
+        sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -264,6 +271,10 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # Guided decoding
+            guided_decoding_grammar=_resolve_grammar(
+                getattr(args, "guided_decoding_grammar", None)
+            ),
         )
         engine_config = EngineConfig(
             model_name=args.model,
