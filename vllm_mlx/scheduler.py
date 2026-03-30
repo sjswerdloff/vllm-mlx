@@ -683,6 +683,10 @@ def _install_mtp(
             draft_logprobs = draft_logits - mx.logsumexp(
                 draft_logits, axis=-1, keepdims=True
             )
+            # TODO: MTP draft tokens bypass logits_processors (including grammar
+            # constraints). If guided decoding is active, draft tokens could
+            # violate the grammar and corrupt the matcher state. Fix: apply
+            # logits_processors to draft_logprobs before sampling.
             draft_tokens = _draft_sampler(draft_logprobs)
 
             # Always-advance: feed [primary, draft] and let cache advance.
@@ -997,6 +1001,10 @@ class Scheduler:
         # Guided decoding: compile grammar once, create per-request processors
         self._compiled_grammar = None
         self._grammar_vocab_size = 0
+        logger.info(
+            f"[guided_decoding] config.guided_decoding_grammar="
+            f"{self.config.guided_decoding_grammar!r}"
+        )
         if self.config.guided_decoding_grammar:
             try:
                 from .guided_decoding import (
@@ -1008,10 +1016,15 @@ class Scheduler:
                 if _HAS_XGRAMMAR:
                     grammar_arg = self.config.guided_decoding_grammar
 
+                    # Unwrap mlx-lm TokenizerWrapper to get HuggingFace tokenizer
+                    hf_tokenizer = self._actual_tokenizer
+                    if hasattr(hf_tokenizer, "_tokenizer"):
+                        hf_tokenizer = hf_tokenizer._tokenizer
+
                     if grammar_arg.lower() == "minimax":
                         # Use built-in MiniMax structural tag
                         result = compile_structural_tag(
-                            self._actual_tokenizer, MINIMAX_STRUCTURAL_TAG
+                            hf_tokenizer, MINIMAX_STRUCTURAL_TAG
                         )
                         if result:
                             self._compiled_grammar, self._grammar_vocab_size = result
@@ -1024,7 +1037,7 @@ class Scheduler:
                         import xgrammar as xgr
 
                         tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-                            self._actual_tokenizer
+                            hf_tokenizer
                         )
                         compiler = xgr.GrammarCompiler(tokenizer_info)
                         self._compiled_grammar = compiler.compile_grammar(grammar_arg)
