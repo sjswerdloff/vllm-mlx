@@ -84,6 +84,10 @@ class SchedulerConfig:
     paged_cache_block_size: int = 64  # Tokens per block
     max_cache_blocks: int = 1000  # Maximum number of cache blocks
 
+    # Guided decoding: grammar-constrained output via XGrammar
+    guided_decoding_grammar: Optional[str] = None  # EBNF grammar string
+    guided_decoding_backend: str = "xgrammar"  # Only xgrammar supported for now
+
     # Chunked prefill: max tokens to prefill per scheduler step (0 = disabled)
     # When enabled, large prompts are split into chunks so that active
     # generation requests are not starved during long prefills.
@@ -990,6 +994,51 @@ class Scheduler:
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
 
+        # Guided decoding: compile grammar once, create per-request processors
+        self._compiled_grammar = None
+        self._grammar_vocab_size = 0
+        if self.config.guided_decoding_grammar:
+            try:
+                from .guided_decoding import (
+                    _HAS_XGRAMMAR,
+                    compile_structural_tag,
+                    MINIMAX_STRUCTURAL_TAG,
+                )
+
+                if _HAS_XGRAMMAR:
+                    grammar_arg = self.config.guided_decoding_grammar
+
+                    if grammar_arg.lower() == "minimax":
+                        # Use built-in MiniMax structural tag
+                        result = compile_structural_tag(
+                            self._actual_tokenizer, MINIMAX_STRUCTURAL_TAG
+                        )
+                        if result:
+                            self._compiled_grammar, self._grammar_vocab_size = result
+                            logger.info(
+                                f"[guided_decoding] MiniMax structural tag compiled, "
+                                f"vocab_size={self._grammar_vocab_size}"
+                            )
+                    else:
+                        # Treat as raw EBNF grammar
+                        import xgrammar as xgr
+
+                        tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+                            self._actual_tokenizer
+                        )
+                        compiler = xgr.GrammarCompiler(tokenizer_info)
+                        self._compiled_grammar = compiler.compile_grammar(grammar_arg)
+                        self._grammar_vocab_size = tokenizer_info.vocab_size
+                        logger.info(
+                            f"[guided_decoding] EBNF grammar compiled, "
+                            f"vocab_size={self._grammar_vocab_size}"
+                        )
+                else:
+                    logger.warning("[guided_decoding] xgrammar not available, grammar ignored")
+            except Exception as e:
+                logger.error(f"[guided_decoding] Failed to compile grammar: {e}")
+                self._compiled_grammar = None
+
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
         self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
@@ -1760,6 +1809,16 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Create per-request guided decoding processor if grammar is compiled
+            request_logits_processors = None
+            if self._compiled_grammar is not None:
+                from .guided_decoding import XGrammarLogitsProcessor
+
+                processor = XGrammarLogitsProcessor(
+                    self._compiled_grammar, self._grammar_vocab_size
+                )
+                request_logits_processors = [[processor]]
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
@@ -1769,6 +1828,7 @@ class Scheduler:
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    logits_processors=request_logits_processors,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1785,6 +1845,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        logits_processors=request_logits_processors,
                     )
                 else:
                     raise

@@ -14,6 +14,18 @@ Usage:
 
 import argparse
 import sys
+from typing import Optional
+
+
+def _resolve_grammar(grammar_arg: Optional[str]) -> Optional[str]:
+    """Resolve grammar argument to grammar identifier or EBNF string.
+
+    Supports shortcut names like 'minimax' for built-in structural tag grammars.
+    """
+    if grammar_arg is None:
+        return None
+    # Return as-is - the scheduler handles both keywords and raw EBNF
+    return grammar_arg
 
 
 def serve_command(args):
@@ -150,6 +162,10 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # Guided decoding
+            guided_decoding_grammar=_resolve_grammar(
+                getattr(args, "guided_decoding_grammar", None)
+            ),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -686,6 +702,13 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    serve_parser.add_argument(
+        "--guided-decoding-grammar",
+        type=str,
+        default=None,
+        help="EBNF grammar string for constrained decoding. Use 'minimax' for "
+        "built-in MiniMax tool call XML grammar. Requires xgrammar.",
     )
     serve_parser.add_argument(
         "--stream-interval",

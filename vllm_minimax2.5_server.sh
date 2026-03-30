@@ -12,5 +12,9 @@ uv run vllm-mlx serve lmstudio-community/MiniMax-M2.5-MLX-8bit \
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --max-tokens 32768 \
     --continuous-batching \
+    --kv-cache-quantization \
+    --guided-decoding-grammar minimax \
+    --enable-auto-tool-choice \
+    --tool-call-parser auto \
     --host 0.0.0.0 \
     --port 8899
