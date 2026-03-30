@@ -116,7 +116,7 @@ class XGrammarLogitsProcessor:
     def reset(self):
         """Reset the processor for a new generation."""
         self.matcher.reset()
-        self._first_call = True
+        self._prompt_length = None
 
 
 def compile_structural_tag(
