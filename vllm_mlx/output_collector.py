@@ -139,6 +139,13 @@ class RequestOutputCollector:
         merged_new_token_ids = existing.new_token_ids + new.new_token_ids
         merged_new_text = existing.new_text + new.new_text
 
+        # Merge logprobs (concatenate per-token lists)
+        merged_logprobs = None
+        if existing.token_logprobs is not None or new.token_logprobs is not None:
+            merged_logprobs = (existing.token_logprobs or []) + (
+                new.token_logprobs or []
+            )
+
         return RequestOutput(
             request_id=new.request_id,
             new_token_ids=merged_new_token_ids,
@@ -149,6 +156,7 @@ class RequestOutputCollector:
             finish_reason=new.finish_reason,
             prompt_tokens=new.prompt_tokens,
             completion_tokens=new.completion_tokens,
+            token_logprobs=merged_logprobs,
         )
 
     def clear(self) -> None:

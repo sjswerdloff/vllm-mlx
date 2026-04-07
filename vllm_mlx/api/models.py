@@ -178,6 +178,10 @@ class ChatCompletionRequest(BaseModel):
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # Logprobs: return log probabilities of output tokens
+    logprobs: bool | None = None
+    # Top logprobs: number of most likely alternative tokens (0-20) per position
+    top_logprobs: int | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -197,11 +201,40 @@ class AssistantMessage(BaseModel):
         return self.reasoning
 
 
+# =============================================================================
+# Logprobs (OpenAI-compatible)
+# =============================================================================
+
+
+class TopLogprob(BaseModel):
+    """A top alternative token with its log probability."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class TokenLogprob(BaseModel):
+    """Log probability info for a single generated token."""
+
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[TopLogprob] = Field(default_factory=list)
+
+
+class ChoiceLogprobs(BaseModel):
+    """Log probability information for a choice."""
+
+    content: list[TokenLogprob] | None = None
+
+
 class ChatCompletionChoice(BaseModel):
     """A single choice in chat completion response."""
 
     index: int = 0
     message: AssistantMessage
+    logprobs: ChoiceLogprobs | None = None
     finish_reason: str | None = "stop"
 
 
@@ -441,6 +474,7 @@ class ChatCompletionChunkChoice(BaseModel):
 
     index: int = 0
     delta: ChatCompletionChunkDelta
+    logprobs: ChoiceLogprobs | None = None
     finish_reason: str | None = None
 
 

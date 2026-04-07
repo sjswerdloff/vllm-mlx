@@ -25,6 +25,8 @@ class GenerationOutput:
     # For streaming
     new_text: str = ""
     finished: bool = True
+    # Per-token logprobs (when requested)
+    token_logprobs: list[dict] | None = None
 
 
 class BaseEngine(ABC):

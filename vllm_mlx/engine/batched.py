@@ -481,6 +481,8 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            logprobs=bool(kwargs.get("logprobs")),
+            top_logprobs=kwargs.get("top_logprobs") or 0,
         )
 
         output = await self._engine.generate(
@@ -495,6 +497,7 @@ class BatchedEngine(BaseEngine):
             prompt_tokens=output.prompt_tokens,
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
+            token_logprobs=output.token_logprobs,
         )
 
     async def stream_generate(
@@ -557,6 +560,8 @@ class BatchedEngine(BaseEngine):
             temperature=temperature,
             top_p=top_p,
             stop=stop or [],
+            logprobs=bool(kwargs.get("logprobs")),
+            top_logprobs=kwargs.get("top_logprobs") or 0,
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
@@ -576,6 +581,7 @@ class BatchedEngine(BaseEngine):
                 completion_tokens=output.completion_tokens,
                 finished=output.finished,
                 finish_reason=output.finish_reason,
+                token_logprobs=output.token_logprobs,
             )
 
     async def chat(

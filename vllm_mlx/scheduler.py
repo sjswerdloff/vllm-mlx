@@ -15,7 +15,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -112,13 +112,13 @@ class SchedulerOutput:
     """
 
     # Requests scheduled in this step
-    scheduled_request_ids: List[str] = field(default_factory=list)
+    scheduled_request_ids: list[str] = field(default_factory=list)
     # Total tokens scheduled
     num_scheduled_tokens: int = 0
     # Requests that finished in this step
-    finished_request_ids: Set[str] = field(default_factory=set)
+    finished_request_ids: set[str] = field(default_factory=set)
     # Request outputs (tokens generated)
-    outputs: List[RequestOutput] = field(default_factory=list)
+    outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
 
@@ -128,9 +128,9 @@ def _install_chunked_prefill(
     budget: int,
     mid_prefill_save=None,
     prompt_cache_save=None,
-    pending_abort_ids: Optional[Set[str]] = None,
-    uid_to_request_id: Optional[Dict[int, str]] = None,
-    requests: Optional[Dict[str, Any]] = None,
+    pending_abort_ids: Optional[set[str]] = None,
+    uid_to_request_id: Optional[dict[int, str]] = None,
+    requests: Optional[dict[str, Any]] = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -989,21 +989,21 @@ class Scheduler:
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
-        self._detokenizer_pool: Dict[str, Any] = {}
+        self._detokenizer_pool: dict[str, Any] = {}
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
-        self.running: Dict[str, Request] = {}  # Running requests by ID
-        self.requests: Dict[str, Request] = {}  # All requests by ID
-        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self.running: dict[str, Request] = {}  # Running requests by ID
+        self.requests: dict[str, Request] = {}  # All requests by ID
+        self.finished_req_ids: set[str] = set()  # Recently finished
 
         # Mapping between our request IDs and BatchGenerator UIDs
-        self.request_id_to_uid: Dict[str, int] = {}
-        self.uid_to_request_id: Dict[int, str] = {}
+        self.request_id_to_uid: dict[str, int] = {}
+        self.uid_to_request_id: dict[int, str] = {}
 
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None
-        self._current_sampler_params: Optional[Tuple] = None
+        self._current_sampler_params: Optional[tuple] = None
 
         # Prefix cache for KV state reuse
         self.prefix_cache: Optional[PrefixCacheManager] = None
@@ -1056,7 +1056,7 @@ class Scheduler:
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
-        self._pending_abort_ids: Set[str] = set()
+        self._pending_abort_ids: set[str] = set()
 
         # Statistics
         self.num_requests_processed = 0
@@ -1085,7 +1085,7 @@ class Scheduler:
         # Fallback to the original
         return tokenizer
 
-    def _decode_tokens(self, token_ids: List[int]) -> str:
+    def _decode_tokens(self, token_ids: list[int]) -> str:
         """
         Decode token IDs to text, handling both tokenizers and processors.
         """
@@ -1106,7 +1106,7 @@ class Scheduler:
         """Remove the streaming detokenizer for a finished request."""
         self._detokenizer_pool.pop(request_id, None)
 
-    def _get_stop_tokens(self) -> Set[int]:
+    def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer or processor."""
         stop_tokens = set()
         # Check both the processor/tokenizer and the actual tokenizer
@@ -1430,7 +1430,7 @@ class Scheduler:
 
         return True
 
-    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+    def _extract_cache_states(self, raw_cache: list[Any]) -> list[dict[str, Any]]:
         """
         Extract actual tensor state from each layer cache.
 
@@ -1468,8 +1468,8 @@ class Scheduler:
         return extracted if len(extracted) == len(raw_cache) else []
 
     def _reconstruct_cache_from_states(
-        self, extracted_states: List[Dict[str, Any]]
-    ) -> Optional[List[Any]]:
+        self, extracted_states: list[dict[str, Any]]
+    ) -> Optional[list[Any]]:
         """
         Reconstruct cache objects from extracted cache states.
 
@@ -1501,6 +1501,8 @@ class Scheduler:
                     # (safe because mid-prefill save is always batch_size=1).
                     from mlx_lm.models.cache import (
                         BatchKVCache as _BatchKVCache,
+                    )
+                    from mlx_lm.models.cache import (
                         KVCache as _KVCache,
                     )
 
@@ -1743,7 +1745,7 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
 
@@ -1847,8 +1849,8 @@ class Scheduler:
         return scheduled
 
     def _process_batch_responses(
-        self, responses: List[Any]
-    ) -> Tuple[List[RequestOutput], Set[str]]:
+        self, responses: list[Any]
+    ) -> tuple[list[RequestOutput], set[str]]:
         """
         Process responses from BatchGenerator.
 
@@ -1896,6 +1898,14 @@ class Scheduler:
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
             )
+
+            # Extract per-token logprobs if requested
+            if request.sampling_params.logprobs and response.logprobs is not None:
+                output.token_logprobs = self._extract_token_logprobs(
+                    response.token,
+                    response.logprobs,
+                    request.sampling_params.top_logprobs,
+                )
 
             # Check if finished
             if response.finish_reason is not None:
@@ -1956,7 +1966,57 @@ class Scheduler:
 
         return outputs, finished_ids
 
-    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+    def _extract_token_logprobs(
+        self,
+        token_id: int,
+        logprobs_array: "mx.array",
+        top_k: int = 0,
+    ) -> list[dict]:
+        """Extract per-token logprob info in OpenAI-compatible format.
+
+        Args:
+            token_id: The sampled token ID
+            logprobs_array: Full log-probability array over vocab [vocab_size]
+            top_k: Number of top alternatives to include (0 = none)
+
+        Returns:
+            List with one dict per token (currently always 1) matching OpenAI format
+        """
+        token_str = self.tokenizer.decode([token_id])
+        token_logprob = logprobs_array[token_id].item()
+        token_bytes = list(token_str.encode("utf-8"))
+
+        top_logprobs_list = []
+        if top_k > 0:
+            # argpartition is O(n), faster than full sort for large vocab
+            k = min(top_k, logprobs_array.shape[0])
+            top_indices = mx.argpartition(-logprobs_array, kth=k - 1)[:k]
+            # Sort the top-k by descending logprob
+            top_lp_values = logprobs_array[top_indices]
+            sorted_order = mx.argsort(-top_lp_values)
+            top_indices = top_indices[sorted_order]
+            top_lp_values = top_lp_values[sorted_order]
+
+            for idx, lp in zip(top_indices.tolist(), top_lp_values.tolist()):
+                alt_token_str = self.tokenizer.decode([idx])
+                top_logprobs_list.append(
+                    {
+                        "token": alt_token_str,
+                        "logprob": lp,
+                        "bytes": list(alt_token_str.encode("utf-8")),
+                    }
+                )
+
+        return [
+            {
+                "token": token_str,
+                "logprob": token_logprob,
+                "bytes": token_bytes,
+                "top_logprobs": top_logprobs_list,
+            }
+        ]
+
+    def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         for request_id in finished_ids:
             request = self.running.get(request_id)
@@ -2128,7 +2188,7 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
-    def _recover_from_generation_error(self) -> Set[str]:
+    def _recover_from_generation_error(self) -> set[str]:
         """Recover from fatal generation error (OOM, Metal crash).
 
         Aborts all running requests and resets batch state.
@@ -2143,7 +2203,7 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Abort all running requests
-        aborted_ids: Set[str] = set()
+        aborted_ids: set[str] = set()
         for request_id in list(self.running):
             request = self.running.get(request_id)
             if request is not None:
@@ -2319,7 +2379,7 @@ class Scheduler:
         """Remove a finished request from tracking."""
         return self.requests.pop(request_id, None)
 
-    def get_running_requests_info(self) -> List[Dict[str, Any]]:
+    def get_running_requests_info(self) -> list[dict[str, Any]]:
         """Per-request details for status endpoint."""
         import time as _time
 
@@ -2387,7 +2447,7 @@ class Scheduler:
 
         return result
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
         stats = {
             "num_waiting": len(self.waiting),
@@ -2414,7 +2474,7 @@ class Scheduler:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> Optional[dict[str, Any]]:
         """Get cache statistics."""
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
