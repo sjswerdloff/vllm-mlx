@@ -483,9 +483,17 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
         )
 
+        # Pass through guided-decoding tools if ``chat`` forwarded them via
+        # kwargs.  Unknown kwargs are filtered so we don't break the
+        # engine's generate signature.
+        engine_kwargs: dict[str, Any] = {}
+        if "tools" in kwargs and kwargs["tools"]:
+            engine_kwargs["tools"] = kwargs["tools"]
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            **engine_kwargs,
         )
 
         text = clean_output_text(output.output_text)
@@ -560,10 +568,12 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        tools = kwargs.pop("tools", None)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            tools=tools,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -627,6 +637,13 @@ class BatchedEngine(BaseEngine):
             template_tools,
             num_images=len(all_images),
         )
+
+        # Forward the raw OpenAI tool list to the engine so that the
+        # scheduler can compile a per-request grammar when guided decoding
+        # is enabled.  ``generate`` accepts arbitrary kwargs and will pass
+        # this through to ``engine.add_request``.
+        if tools:
+            kwargs.setdefault("tools", tools)
 
         return await self.generate(
             prompt=prompt,
@@ -743,6 +760,11 @@ class BatchedEngine(BaseEngine):
         prefix_boundary = self._compute_prefix_boundary(messages, tools)
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+
+        # Forward the raw OpenAI tool list so the scheduler can compile a
+        # per-request grammar when guided decoding is enabled.
+        if tools:
+            kwargs.setdefault("tools", tools)
 
         async for output in self.stream_generate(
             prompt=prompt,

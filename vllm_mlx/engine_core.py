@@ -15,15 +15,16 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import mlx.core as mx
 
+from .model_registry import get_registry
+from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
-from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +93,9 @@ class EngineCore:
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
-        self._output_collectors: Dict[str, RequestOutputCollector] = {}
-        self._stream_states: Dict[str, RequestStreamState] = {}
-        self._finished_events: Dict[str, asyncio.Event] = {}
+        self._output_collectors: dict[str, RequestOutputCollector] = {}
+        self._stream_states: dict[str, RequestStreamState] = {}
+        self._finished_events: dict[str, asyncio.Event] = {}
 
         # Engine state
         self._running = False
@@ -258,12 +259,13 @@ class EngineCore:
 
     async def add_request(
         self,
-        prompt: Union[str, List[int]],
+        prompt: Union[str, list[int]],
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
-        images: Optional[List[Any]] = None,
-        videos: Optional[List[Any]] = None,
+        images: Optional[list[Any]] = None,
+        videos: Optional[list[Any]] = None,
         prefix_boundary: int = 0,
+        tools: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -292,6 +294,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            tools=tools,
         )
 
         # Setup output collector with stream_interval from config
@@ -411,7 +414,7 @@ class EngineCore:
 
     async def generate(
         self,
-        prompt: Union[str, List[int]],
+        prompt: Union[str, list[int]],
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
         **kwargs,
@@ -475,9 +478,9 @@ class EngineCore:
 
     def generate_batch_sync(
         self,
-        prompts: List[Union[str, List[int]]],
+        prompts: list[Union[str, list[int]]],
         sampling_params: Optional[SamplingParams] = None,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         """
         Generate responses synchronously for maximum throughput.
 
@@ -492,8 +495,9 @@ class EngineCore:
         Returns:
             List of RequestOutput in same order as prompts
         """
-        from .request import Request
         import uuid as uuid_module
+
+        from .request import Request
 
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -511,7 +515,7 @@ class EngineCore:
             request_ids.append(request_id)
 
         # Process until all done - direct scheduler access, no async overhead
-        results: Dict[str, RequestOutput] = {}
+        results: dict[str, RequestOutput] = {}
         while self.scheduler.has_requests():
             output = self.scheduler.step()
             for req_output in output.outputs:
@@ -525,7 +529,7 @@ class EngineCore:
         # Return in original order
         return [results[rid] for rid in request_ids]
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         scheduler_stats = self.scheduler.get_stats()
         uptime = time.time() - self._start_time if self._start_time else 0
@@ -540,7 +544,7 @@ class EngineCore:
             **scheduler_stats,
         }
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> Optional[dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.scheduler.get_cache_stats()
 
@@ -642,7 +646,7 @@ class AsyncEngineCore:
 
     async def add_request(
         self,
-        prompt: Union[str, List[int]],
+        prompt: Union[str, list[int]],
         sampling_params: Optional[SamplingParams] = None,
         request_id: Optional[str] = None,
         **kwargs,
@@ -670,7 +674,7 @@ class AsyncEngineCore:
 
     async def generate(
         self,
-        prompt: Union[str, List[int]],
+        prompt: Union[str, list[int]],
         sampling_params: Optional[SamplingParams] = None,
         **kwargs,
     ) -> RequestOutput:
@@ -681,11 +685,11 @@ class AsyncEngineCore:
             **kwargs,
         )
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get engine stats."""
         return self.engine.get_stats()
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> Optional[dict[str, Any]]:
         """Get prefix cache statistics."""
         return self.engine.get_cache_stats()
 

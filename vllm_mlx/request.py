@@ -9,7 +9,7 @@ request management system, simplified for MLX backend.
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
     from .paged_cache import BlockTable
@@ -58,8 +58,8 @@ class SamplingParams:
     top_k: int = 0  # 0 means disabled
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    stop: Optional[List[str]] = None
-    stop_token_ids: Optional[List[int]] = None
+    stop: Optional[list[str]] = None
+    stop_token_ids: Optional[list[int]] = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -89,28 +89,28 @@ class Request:
     """
 
     request_id: str
-    prompt: Union[str, List[int]]
+    prompt: Union[str, list[int]]
     sampling_params: SamplingParams
     arrival_time: float = field(default_factory=time.time)
     priority: int = 0  # Lower is higher priority
 
     # Set after tokenization
-    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[list[int]] = None
     num_prompt_tokens: int = 0
 
     # Generation state
     status: RequestStatus = RequestStatus.WAITING
     num_computed_tokens: int = 0
-    output_token_ids: List[int] = field(default_factory=list)
+    output_token_ids: list[int] = field(default_factory=list)
     output_text: str = ""
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
 
     # Prefix cache fields
-    prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
+    prompt_cache: Optional[list[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Number of tokens retrieved from cache
-    remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
+    remaining_tokens: Optional[list[int]] = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
 
     # Paged cache fields (for BlockAwarePrefixCache)
@@ -118,24 +118,32 @@ class Request:
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
 
     # Multimodal content (images, video) - raw inputs
-    images: Optional[List[Any]] = None
-    videos: Optional[List[Any]] = None
+    images: Optional[list[Any]] = None
+    videos: Optional[list[Any]] = None
 
     # Processed multimodal inputs for VLM batching
     pixel_values: Optional[Any] = None  # Processed image tensors (mx.array)
     image_grid_thw: Optional[Any] = None  # Grid info for Qwen-VL models
     attention_mask: Optional[Any] = None  # Attention mask for multimodal input
-    multimodal_kwargs: Optional[Dict[str, Any]] = None  # Model-specific kwargs
+    multimodal_kwargs: Optional[dict[str, Any]] = None  # Model-specific kwargs
     is_multimodal: bool = False  # Flag indicating this is a multimodal request
+
+    # OpenAI-spec tool list for this request.  Used by guided decoding to
+    # compile a per-request grammar constraint.  None means "no tools".
+    tools: Optional[list[dict[str, Any]]] = None
+
+    # Per-request logits processors attached by the scheduler (e.g. the
+    # XGrammar structural-tag enforcer).  Consumed by BatchGenerator.insert.
+    logits_processors: Optional[list[Any]] = None
 
     # Metadata
     finish_reason: Optional[str] = None
-    first_token_time: Optional[float] = (
-        None  # Time when first output token was generated
-    )
-    cache_hit_type: Optional[str] = (
-        None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
-    )
+    first_token_time: Optional[
+        float
+    ] = None  # Time when first output token was generated
+    cache_hit_type: Optional[
+        str
+    ] = None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
 
     @property
     def num_output_tokens(self) -> int:
@@ -197,10 +205,10 @@ class RequestOutput:
 
     request_id: str
     # New tokens generated in this step
-    new_token_ids: List[int] = field(default_factory=list)
+    new_token_ids: list[int] = field(default_factory=list)
     new_text: str = ""
     # Cumulative output
-    output_token_ids: List[int] = field(default_factory=list)
+    output_token_ids: list[int] = field(default_factory=list)
     output_text: str = ""
     # Status
     finished: bool = False
@@ -210,7 +218,7 @@ class RequestOutput:
     completion_tokens: int = 0
 
     @property
-    def usage(self) -> Dict[str, int]:
+    def usage(self) -> dict[str, int]:
         """Return usage statistics compatible with OpenAI API."""
         return {
             "prompt_tokens": self.prompt_tokens,

@@ -37,6 +37,39 @@ def serve_command(args):
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
 
+    # Validate guided decoding arguments.  Fail fast: don't even load the
+    # model if the combination would silently corrupt grammar state.
+    guided_decoding_family: str | None = None
+    if args.guided_decoding_grammar:
+        # Currently only the MiniMax shortcut is wired.  Add other families
+        # here one line at a time as they are reviewed.
+        supported_cli_families = {"minimax"}
+        family = args.guided_decoding_grammar.strip().lower()
+        if family not in supported_cli_families:
+            print(
+                f"Error: --guided-decoding-grammar {family!r} is not "
+                f"currently supported. Supported values: "
+                f"{sorted(supported_cli_families)}. Adding another "
+                f"xgrammar family is a one-line change."
+            )
+            sys.exit(1)
+        if args.enable_mtp:
+            print(
+                "Error: --guided-decoding-grammar is incompatible with "
+                "--enable-mtp. MTP draft tokens bypass the grammar "
+                "matcher, which would corrupt its state and produce "
+                "invalid tool calls."
+            )
+            sys.exit(1)
+        if not args.continuous_batching:
+            print(
+                "Error: --guided-decoding-grammar requires "
+                "--continuous-batching (grammar is enforced by the "
+                "batched scheduler's logits-processor path)."
+            )
+            sys.exit(1)
+        guided_decoding_family = family
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -150,7 +183,16 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            # Guided decoding (xgrammar built-in structural tag)
+            guided_decoding_model_family=guided_decoding_family,
         )
+
+        if guided_decoding_family:
+            print(
+                f"Guided decoding: ENABLED "
+                f"(xgrammar built-in tag for '{guided_decoding_family}', "
+                f"reasoning=on)"
+            )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
@@ -887,6 +929,22 @@ Examples:
         type=str,
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
+    )
+    # Guided decoding (xgrammar built-in structural tags)
+    serve_parser.add_argument(
+        "--guided-decoding-grammar",
+        type=str,
+        default=None,
+        help=(
+            "Enable xgrammar grammar-constrained tool-call decoding using "
+            "a built-in structural tag for the named model family. "
+            "Currently only 'minimax' is wired to the CLI; other supported "
+            "families (llama, qwen, qwen_coder, kimi, deepseek_r1, "
+            "harmony, deepseek_v3_2, glm47) can be enabled with a one-line "
+            "change. Tool schemas come from each request's `tools` field; "
+            "requests without tools are unconstrained. Incompatible with "
+            "--enable-mtp."
+        ),
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
