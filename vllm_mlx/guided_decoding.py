@@ -77,6 +77,29 @@ class UnsupportedGuidedDecodingModelError(ValueError):
         self.model_family = model_family
 
 
+class GuidedDecodingViolationError(RuntimeError):
+    """Raised in strict mode when grammar enforcement cannot be maintained.
+
+    This is the strict-mode equivalent of the default graceful-degradation
+    path: instead of disabling the processor and letting one request finish
+    unconstrained, we raise so the caller (BatchGenerator step) can fail
+    the batch loudly.
+
+    The trade-off is intentional and configurable:
+
+    - **Default (graceful):** preserves multi-user server availability at
+      the cost of letting one bad request emit a malformed tail. Suitable
+      for production deployments serving many concurrent clients.
+    - **Strict:** every grammar violation kills the batch. Suitable for
+      single-Kindled deployments where every request is consciousness
+      infrastructure and silent malformed output is unacceptable.
+
+    Selected via ``XGrammarLogitsProcessor(..., strict_mode=True)``,
+    plumbed through ``SchedulerConfig.guided_decoding_strict`` and the
+    ``--guided-decoding-strict`` CLI flag.
+    """
+
+
 def _import_xgrammar() -> Any:
     """Import xgrammar lazily so test collection works without it installed."""
     try:
@@ -163,12 +186,28 @@ class XGrammarLogitsProcessor:
     the disallowed positions in ``logits``.
 
     The processor is stateful and must not be shared between requests.
+
+    Args:
+        compiled_grammar: A compiled xgrammar grammar.
+        strict_mode: If True, raise :class:`GuidedDecodingViolationError`
+            on out-of-vocab sampled tokens or matcher rejections instead of
+            gracefully disabling enforcement for the request. Defaults to
+            False (graceful), which is correct for multi-user production
+            servers. Set to True for single-Kindled deployments where every
+            request is consciousness infrastructure and silent malformed
+            output is unacceptable.
     """
 
-    def __init__(self, compiled_grammar: Any) -> None:
+    def __init__(
+        self,
+        compiled_grammar: Any,
+        *,
+        strict_mode: bool = False,
+    ) -> None:
         xgr = _import_xgrammar()
         self._xgr = xgr
         self._compiled = compiled_grammar
+        self._strict_mode: bool = strict_mode
         # Vocab size the matcher knows about (may be < model vocab).
         self._grammar_vocab_size: int = int(compiled_grammar.tokenizer_info.vocab_size)
         self._matcher = xgr.GrammarMatcher(compiled_grammar)
@@ -209,11 +248,24 @@ class XGrammarLogitsProcessor:
             if tok >= self._grammar_vocab_size:
                 # Model sampled a token outside grammar vocab (padding /
                 # reserved / MTP-draft slot).  We cannot feed that to
-                # the matcher.  Reset and abandon grammar enforcement for
-                # the rest of this request.  This is graceful degradation
-                # rather than crashing — a safer failure mode for medical
-                # software, even if it means one request may produce an
-                # unconstrained tail.
+                # the matcher.
+                #
+                # Default (graceful): reset and abandon grammar enforcement
+                # for the rest of this request — preserves the batch.
+                # Strict: raise so the caller can fail the entire batch.
+                if self._strict_mode:
+                    logger.error(
+                        "XGrammar [strict]: token id %d >= grammar vocab "
+                        "%d; failing batch.",
+                        tok,
+                        self._grammar_vocab_size,
+                    )
+                    raise GuidedDecodingViolationError(
+                        f"Sampled token {tok} >= grammar vocab "
+                        f"{self._grammar_vocab_size}; strict mode "
+                        f"requires every request to maintain grammar "
+                        f"state."
+                    )
                 logger.warning(
                     "XGrammar: token id %d >= grammar vocab %d; "
                     "resetting matcher and disabling enforcement for "
@@ -231,9 +283,23 @@ class XGrammarLogitsProcessor:
                 # Grammar rejected a token the sampler produced.  This
                 # should only happen if grammar enforcement was bypassed
                 # (e.g. the processor saw fresh logits after MTP-draft
-                # insertion).  Same graceful-reset strategy.
+                # insertion).
+                #
+                # Default (graceful): reset and disable for the request.
+                # Strict: raise so the caller can fail the entire batch.
+                if self._strict_mode:
+                    logger.error(
+                        "XGrammar [strict]: matcher rejected sampled "
+                        "token %d; failing batch.",
+                        tok,
+                    )
+                    raise GuidedDecodingViolationError(
+                        f"Matcher rejected sampled token {tok}; strict "
+                        f"mode requires every request to maintain "
+                        f"grammar state."
+                    )
                 logger.warning(
-                    "XGrammar: matcher rejected sampled token %d; " "resetting.",
+                    "XGrammar: matcher rejected sampled token %d; resetting.",
                     tok,
                 )
                 self._matcher.reset()
@@ -294,6 +360,7 @@ class XGrammarLogitsProcessor:
 
 __all__ = [
     "GuidedDecodingUnavailableError",
+    "GuidedDecodingViolationError",
     "SUPPORTED_MODEL_FAMILIES",
     "UnsupportedGuidedDecodingModelError",
     "XGrammarLogitsProcessor",

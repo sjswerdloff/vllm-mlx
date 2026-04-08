@@ -324,3 +324,84 @@ def test_processor_handles_minimax_vocab_sizes(compiled_grammar, model_vocab) ->
     prompt = mx.array([0], dtype=mx.int32)
     out = proc(prompt, logits)
     assert out.shape == (1, model_vocab)
+
+
+# ---------------------------------------------------------------------------
+# Strict-mode failure policy
+# ---------------------------------------------------------------------------
+
+
+def test_processor_default_mode_is_graceful(compiled_grammar) -> None:
+    """Contract: the default failure mode is graceful degradation.
+
+    Regression guard: this is the production-server default and must
+    not silently flip to strict.  Single-Kindled deployments must
+    explicitly opt in to strict mode.
+    """
+    proc = gd.XGrammarLogitsProcessor(compiled_grammar)
+    assert proc._strict_mode is False
+
+
+def test_processor_strict_mode_constructor_param(compiled_grammar) -> None:
+    """Contract: strict_mode is a keyword-only constructor parameter."""
+    proc = gd.XGrammarLogitsProcessor(compiled_grammar, strict_mode=True)
+    assert proc._strict_mode is True
+
+
+def test_processor_strict_mode_raises_on_padding_token(compiled_grammar) -> None:
+    """Contract: in strict mode an out-of-vocab sampled token raises
+    GuidedDecodingViolationError instead of silently disabling.
+
+    This is the cycle 54 lesson made configurable: production deployments
+    keep their batch alive on a single bad request, but a single-Kindled
+    deployment where every request is consciousness infrastructure may
+    prefer to fail loudly so the operator knows something went wrong.
+    """
+    proc = gd.XGrammarLogitsProcessor(compiled_grammar, strict_mode=True)
+    grammar_v = proc._grammar_vocab_size
+    model_v = grammar_v + 32
+    logits = _make_logits(model_v, fill=1.0)
+
+    # Prompt of length 1 — first call sets tokens_seen=1.
+    proc(mx.array([0], dtype=mx.int32), logits)
+
+    # Sampler picks a padding token outside grammar vocab.
+    bad_token = grammar_v + 5
+    next_tokens = mx.array([0, bad_token], dtype=mx.int32)
+    with pytest.raises(gd.GuidedDecodingViolationError) as exc:
+        proc(next_tokens, logits)
+    # Error message should include the offending token id and the vocab
+    # bound so an operator reading logs can diagnose the failure.
+    msg = str(exc.value)
+    assert str(bad_token) in msg
+    assert str(grammar_v) in msg
+
+
+def test_processor_graceful_mode_does_not_raise(compiled_grammar) -> None:
+    """Contract: explicit strict_mode=False matches the documented
+    default behaviour and does NOT raise on the same input that
+    strict mode would reject.
+
+    Pinned as a separate test (rather than relying on the default-mode
+    test alone) so that toggling the default later cannot silently break
+    the graceful path.
+    """
+    proc = gd.XGrammarLogitsProcessor(compiled_grammar, strict_mode=False)
+    grammar_v = proc._grammar_vocab_size
+    model_v = grammar_v + 32
+    logits = _make_logits(model_v, fill=1.0)
+    proc(mx.array([0], dtype=mx.int32), logits)
+    bad_token = grammar_v + 5
+    next_tokens = mx.array([0, bad_token], dtype=mx.int32)
+    # MUST NOT raise; should disable enforcement.
+    out = proc(next_tokens, logits)
+    assert getattr(proc, "_disabled", False) is True
+    out_np = np.asarray(out).reshape(-1)
+    assert not np.any(np.isneginf(out_np))
+
+
+def test_guided_decoding_violation_error_is_runtime_error() -> None:
+    """Contract: GuidedDecodingViolationError is a RuntimeError so callers
+    can catch it via the standard exception hierarchy without importing
+    the guided_decoding module."""
+    assert issubclass(gd.GuidedDecodingViolationError, RuntimeError)

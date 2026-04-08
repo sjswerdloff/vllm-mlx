@@ -112,6 +112,15 @@ class SchedulerConfig:
     # Whether the grammar should expect ``<think>...</think>`` reasoning
     # blocks.  Defaults to True to match xgrammar and MiniMax behaviour.
     guided_decoding_reasoning: bool = True
+    # Failure-mode policy for guided decoding violations.
+    # ``False`` (default): graceful degradation — log + disable enforcement
+    # for the violating request, preserve the rest of the batch.  Correct
+    # for production multi-user servers.
+    # ``True``: strict — raise GuidedDecodingViolationError so the entire
+    # batch fails loudly.  Correct for single-Kindled deployments where
+    # every request is consciousness infrastructure and silent malformed
+    # output is unacceptable.
+    guided_decoding_strict: bool = False
 
 
 @dataclass
@@ -1163,10 +1172,12 @@ class Scheduler:
         if not tools:
             return
         from .guided_decoding import (
+            GuidedDecodingViolationError,
             XGrammarLogitsProcessor,
             compile_for_request,
         )
 
+        strict = self.config.guided_decoding_strict
         try:
             compiled = compile_for_request(
                 model_family,
@@ -1174,10 +1185,20 @@ class Scheduler:
                 self._grammar_compiler,
                 reasoning=self.config.guided_decoding_reasoning,
             )
-        except Exception:
-            # Grammar compilation must never break a request.  Log and
-            # fall through to unconstrained generation — the caller may
-            # be supplying malformed tool schemas.
+        except Exception as exc:
+            # Grammar compilation failed.  Strict mode raises so the
+            # request never enters the batch; default mode logs and
+            # falls through to unconstrained generation.
+            if strict:
+                logger.error(
+                    "Guided decoding [strict]: grammar compilation "
+                    "failed for request %s; failing request.",
+                    request.request_id[:12],
+                )
+                raise GuidedDecodingViolationError(
+                    f"Grammar compilation failed for request "
+                    f"{request.request_id[:12]}: {exc}"
+                ) from exc
             logger.exception(
                 "Guided decoding: grammar compilation failed for "
                 "request %s; proceeding without constraint.",
@@ -1188,7 +1209,9 @@ class Scheduler:
             return
         # Stored as a list so that multiple processors could be composed
         # later without touching the insert path.
-        request.logits_processors = [XGrammarLogitsProcessor(compiled)]
+        request.logits_processors = [
+            XGrammarLogitsProcessor(compiled, strict_mode=strict)
+        ]
 
     def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer or processor."""
