@@ -14,14 +14,14 @@ Also includes structured output (JSON Schema) utilities:
 import json
 import re
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
-from jsonschema import validate, ValidationError
+from jsonschema import ValidationError, validate
 
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 
-def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
+def _parse_raw_json_tool_calls(text: str) -> list[dict] | None:
     """
     Parse raw JSON tool calls from model output.
 
@@ -84,7 +84,7 @@ def _parse_raw_json_tool_calls(text: str) -> Optional[List[dict]]:
 
 def parse_tool_calls(
     text: str, request: dict[str, Any] | None = None
-) -> Tuple[str, Optional[List[ToolCall]]]:
+) -> tuple[str, list[ToolCall] | None]:
     """
     Parse tool calls from model output.
 
@@ -305,7 +305,7 @@ def parse_tool_calls(
     return cleaned_text, tool_calls if tool_calls else None
 
 
-def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
+def convert_tools_for_template(tools: list | None) -> list[dict] | None:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.
 
@@ -388,9 +388,7 @@ def format_tool_call_for_message(tool_call: ToolCall) -> dict:
 # =============================================================================
 
 
-def validate_json_schema(
-    data: Any, schema: Dict[str, Any]
-) -> Tuple[bool, Optional[str]]:
+def validate_json_schema(data: Any, schema: dict[str, Any]) -> tuple[bool, str | None]:
     """
     Validate JSON data against a JSON Schema.
 
@@ -410,7 +408,7 @@ def validate_json_schema(
         return False, str(e.message)
 
 
-def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+def extract_json_from_text(text: str) -> dict[str, Any] | None:
     """
     Extract JSON from model output text.
 
@@ -461,8 +459,8 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_json_output(
-    text: str, response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
-) -> Tuple[str, Optional[Dict[str, Any]], bool, Optional[str]]:
+    text: str, response_format: ResponseFormat | dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any] | None, bool, str | None]:
     """
     Parse JSON from model output when response_format is set.
 
@@ -529,8 +527,8 @@ def parse_json_output(
 
 
 def build_json_system_prompt(
-    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None,
-) -> Optional[str]:
+    response_format: ResponseFormat | dict[str, Any] | None = None,
+) -> str | None:
     """
     Build a system prompt instruction for JSON output.
 

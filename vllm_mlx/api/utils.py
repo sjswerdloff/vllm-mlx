@@ -138,12 +138,12 @@ class StreamingToolCallFilter:
     parsing at stream end.
     """
 
-    def __init__(self):
-        self._buffer = ""
-        self._in_block = False
-        self._close_tag = ""
+    def __init__(self) -> None:
+        self._buffer: str = ""
+        self._in_block: bool = False
+        self._close_tag: str = ""
         # Longest open tag - used to determine how much buffer to hold back
-        self._max_open_len = max(len(t[0]) for t in _TOOL_CALL_TAGS)
+        self._max_open_len: int = max(len(t[0]) for t in _TOOL_CALL_TAGS)
 
     def process(self, delta: str) -> str:
         """Process a streaming delta. Returns text to emit (may be empty)."""
@@ -254,7 +254,7 @@ class StreamingThinkRouter:
     def process(self, delta: str) -> list[tuple[str, str]]:
         """Process a delta. Returns list of (block_type, text) pieces."""
         self._buffer += delta
-        pieces = []
+        pieces: list[tuple[str, str]] = []
         self._extract_pieces(pieces)
         return pieces
 
@@ -367,10 +367,7 @@ def is_mllm_model(model_name: str) -> bool:
         True if model is detected as MLLM/VLM
     """
     model_lower = model_name.lower()
-    for pattern in MLLM_PATTERNS:
-        if pattern.lower() in model_lower:
-            return True
-    return False
+    return any(pattern.lower() in model_lower for pattern in MLLM_PATTERNS)
 
 
 # Backwards compatibility alias

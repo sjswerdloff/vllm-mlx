@@ -10,12 +10,12 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
     """Test parsing of MiniMax-style tool calls."""
 
     def test_single_tool_call(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="get_weather">
 <parameter name="city">Wanaka</parameter>
 <parameter name="units">celsius</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -27,12 +27,12 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
         self.assertEqual(cleaned, "")
 
     def test_tool_call_with_surrounding_text(self):
-        text = '''Let me check the weather for you.
+        text = """Let me check the weather for you.
 <minimax:tool_call>
 <invoke name="get_weather">
 <parameter name="city">Wanaka</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -40,7 +40,7 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
         self.assertIn("Let me check", cleaned)
 
     def test_multiple_tool_calls(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="search">
 <parameter name="query">MiniMax M2.5</parameter>
 </invoke>
@@ -49,7 +49,7 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
 <invoke name="read_file">
 <parameter name="path">/tmp/test.txt</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -58,12 +58,12 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
         self.assertEqual(tool_calls[1].function.name, "read_file")
 
     def test_json_parameter_value(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="create_event">
 <parameter name="title">Meeting</parameter>
 <parameter name="attendees">["stuart", "frida"]</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -72,21 +72,21 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
         self.assertEqual(args["attendees"], ["stuart", "frida"])
 
     def test_numeric_parameter(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="set_temperature">
 <parameter name="value">42</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         args = json.loads(tool_calls[0].function.arguments)
         self.assertEqual(args["value"], 42)
 
     def test_no_parameters(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="get_time">
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -95,14 +95,14 @@ class TestMiniMaxToolCallParsing(unittest.TestCase):
         self.assertEqual(args, {})
 
     def test_with_think_tags_preserved(self):
-        text = '''<think>
+        text = """<think>
 I should check the weather first.
 </think>
 <minimax:tool_call>
 <invoke name="get_weather">
 <parameter name="city">Wanaka</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         cleaned, tool_calls = parse_tool_calls(text)
         self.assertIsNotNone(tool_calls)
@@ -115,11 +115,11 @@ I should check the weather first.
         self.assertEqual(cleaned, text)
 
     def test_tool_call_id_format(self):
-        text = '''<minimax:tool_call>
+        text = """<minimax:tool_call>
 <invoke name="test">
 <parameter name="x">1</parameter>
 </invoke>
-</minimax:tool_call>'''
+</minimax:tool_call>"""
 
         _, tool_calls = parse_tool_calls(text)
         self.assertTrue(tool_calls[0].id.startswith("call_"))
