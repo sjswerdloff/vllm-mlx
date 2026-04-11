@@ -800,12 +800,13 @@ def _install_mtp(
             # RNN snapshot, then re-advance with just P so both cache
             # types end up consistent at [..., P].
             _rnn_snapshots = {}
-            for _ci, _c in enumerate(prompt_cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            s.copy() if s is not None else None for s in _c.state
-                        ]
+            if not optimistic:
+                for _ci, _c in enumerate(prompt_cache):
+                    if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
+                        if hasattr(_c, "state"):
+                            _rnn_snapshots[_ci] = [
+                                s.copy() if s is not None else None for s in _c.state
+                            ]
 
             verify_input = mx.concatenate(
                 [primary_tokens[:, None], draft_tokens[:, None]], axis=1
