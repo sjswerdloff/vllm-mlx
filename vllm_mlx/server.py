@@ -2590,7 +2590,7 @@ async def stream_chat_completion(
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived - incomplete tool call)
+    # (e.g., </tool_call> never arrived, or <function= block still incomplete)
     if (
         tool_parser
         and tool_accumulated_text
@@ -2598,6 +2598,7 @@ async def stream_chat_completion(
         and (
             "<tool_call>" in tool_accumulated_text
             or "<|tool_call>" in tool_accumulated_text
+            or "<function" in tool_accumulated_text
         )
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
