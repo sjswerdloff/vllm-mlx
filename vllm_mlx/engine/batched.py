@@ -237,6 +237,15 @@ class BatchedEngine(BaseEngine):
         kv_group_size = getattr(
             self._scheduler_config, "kv_cache_quantization_group_size", 64
         )
+
+        # Forward MLLM prefill-step override only when explicitly configured.
+        # This keeps default behavior unchanged for MLLM (1024) unless set.
+        prefill_step_size = getattr(
+            self._scheduler_config, "mllm_prefill_step_size", None
+        )
+        mllm_extra = {}
+        if prefill_step_size is not None:
+            mllm_extra["prefill_step_size"] = prefill_step_size
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -249,6 +258,7 @@ class BatchedEngine(BaseEngine):
             kv_cache_quantization=kv_quant,
             kv_cache_quantization_bits=kv_bits,
             kv_cache_quantization_group_size=kv_group_size,
+            **mllm_extra,
         )
 
         # Create and start MLLM scheduler
@@ -262,7 +272,8 @@ class BatchedEngine(BaseEngine):
         logger.info(
             f"MLLM Scheduler started with continuous batching: "
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
-            f"completion_batch={completion_batch_size}"
+            f"completion_batch={completion_batch_size}, "
+            f"prefill_step_size={mllm_config.prefill_step_size}"
         )
 
     def _inject_mtp_mllm(self) -> None:

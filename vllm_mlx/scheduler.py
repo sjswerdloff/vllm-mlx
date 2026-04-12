@@ -62,6 +62,8 @@ class SchedulerConfig:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+    # Optional override for MLLM prefill guard (None = use MLLM default).
+    mllm_prefill_step_size: Optional[int] = None
 
     # Prefix cache settings
     enable_prefix_cache: bool = True
@@ -101,6 +103,10 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+
+    def __post_init__(self) -> None:
+        if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
+            raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
 
 @dataclass
