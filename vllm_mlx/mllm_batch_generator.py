@@ -849,6 +849,16 @@ class MLLMBatchGenerator:
                 layer_cache.values = layer_cache._trim(trim_size, layer_cache.values)
                 layer_cache._idx = layer_cache.max_size
             layer_cache.offset = min(layer_cache.offset, layer_cache.max_size)
+            # Defensive: ensure size() <= keys.shape[2] to prevent merge crash.
+            # Prefix cache trimming can create offset > keys.shape[2] when
+            # a supersequence/LCP trim crosses the max_size boundary.
+            buf_len = layer_cache.keys.shape[2]
+            if min(layer_cache.offset, layer_cache.max_size) > buf_len:
+                logger.warning(
+                    f"RotatingKVCache offset ({layer_cache.offset}) > "
+                    f"buffer ({buf_len}), capping to buffer size"
+                )
+                layer_cache.offset = buf_len
 
     def _run_chunked_text_prefill(
         self, request: MLLMBatchRequest, cache: List[Any]
