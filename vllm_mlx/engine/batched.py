@@ -342,6 +342,13 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # Normalize chat template for prefix-cache stability.
+        # Qwen3.5's template uses last_query_index to conditionally wrap
+        # assistant turns in <think> tags. This makes the prefix unstable
+        # across turns (adding a user message re-renders all prior assistant
+        # turns). Remove the conditional so all turns render consistently.
+        self._normalize_tokenizer_template_for_prefix_cache()
+
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             from ..patches.qwen3_5_mtp import validate_mtp_support as validate_35
@@ -805,6 +812,61 @@ class BatchedEngine(BaseEngine):
             return lcp
         except Exception:
             return 0
+
+    def _normalize_tokenizer_template_for_prefix_cache(self) -> None:
+        """Normalize the tokenizer's chat template for prefix-cache stability.
+
+        Qwen3.5's template uses last_query_index to conditionally wrap
+        assistant turns in <think> tags. When a new user message is added,
+        last_query_index shifts forward, retroactively changing how ALL
+        previous assistant turns render. This breaks prefix cache because
+        the token sequence changes from the very beginning.
+
+        Fix: remove the last_query_index conditional so all assistant turns
+        use the plain format consistently. The generation prompt still adds
+        <think> at the end so the model generates thinking.
+
+        Same logic as MLLMBatchGenerator._normalize_chat_template_for_prefix_cache
+        but applied to the LLM tokenizer directly.
+        """
+        if self._tokenizer is None:
+            return
+
+        template = getattr(self._tokenizer, "chat_template", None)
+        if not template or "last_query_index" not in template:
+            return
+
+        import re
+
+        # Match the nested structure:
+        #   {%- if loop.index0 > ns.last_query_index %}
+        #       {%- if ... %}  ...  {%- else %} ... {%- endif %}  ← nested
+        #   {%- else %}
+        #       {{- plain content }}
+        #   {%- endif %}
+        pattern = (
+            r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
+            r"\s*\{%-\s*if\b.*?%\}"  # nested IF
+            r".*?"
+            r"\{%-\s*else\s*%\}"     # nested ELSE
+            r".*?"
+            r"\{%-\s*endif\s*%\}"    # nested ENDIF
+            r"\s*\{%-\s*else\s*%\}"  # OUTER ELSE
+            r"\s*(\{\{-.*?\}\})"     # plain content (capture)
+            r"\s*\{%-\s*endif\s*%\}" # OUTER ENDIF
+        )
+        new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
+        if new_template != template:
+            self._tokenizer.chat_template = new_template
+            logger.info(
+                "[prefix_cache] Normalized tokenizer chat template: removed "
+                "last_query_index conditional for prefix-stable assistant turns"
+            )
+        else:
+            logger.debug(
+                "[prefix_cache] Tokenizer template has last_query_index but "
+                "regex did not match — template may use a different pattern"
+            )
 
     async def stream_chat(
         self,
