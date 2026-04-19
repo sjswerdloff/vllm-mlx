@@ -539,7 +539,10 @@ def _install_chunked_prefill(
                         _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
                         _adjusted_pb = _pb - _cached
                         if 0 < _adjusted_pb < padded.shape[1] - prompt_checkpoint + 1:
-                            _first_chunk = _adjusted_pb
+                            # Cap to budget to prevent OOM on large prefixes.
+                            # The boundary cache save still happens at the
+                            # correct position via mid_prefill_save_callback.
+                            _first_chunk = min(_adjusted_pb, budget)
                     n_to_process = min(
                         _first_chunk, padded.shape[1] - prompt_checkpoint
                     )
