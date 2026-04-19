@@ -432,11 +432,14 @@ class BatchedEngine(BaseEngine):
         which dropped system prompts and all prior turns.
         """
         # Choose the best template applicator.
-        # For MLLM models, the processor handles special vision tokens.
-        # For text-only models, the tokenizer is sufficient.
+        # For MLLM models WITH images, the processor handles special vision
+        # tokens. For text-only requests (even on MLLM models), the tokenizer
+        # is sufficient and avoids processor template incompatibilities with
+        # tool-use formats (e.g. Anthropic API tool_result blocks).
         template_applicator = None
         if (
             self._is_mllm
+            and num_images > 0
             and self._processor
             and hasattr(self._processor, "apply_chat_template")
         ):
