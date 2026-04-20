@@ -16,13 +16,16 @@ logger = logging.getLogger(__name__)
 
 # Pattern to match special tokens that should be removed from output
 # Keeps <think>...</think> blocks intact for reasoning models
+# NOTE: <tool_call> tags are NOT stripped here — they are handled by
+# the streaming tool parser (--enable-auto-tool-choice) and
+# _TOOL_MARKUP_PATTERN in server.py. Stripping them here prevents
+# the tool parser from detecting tool call boundaries.
 SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|im_end\|>|<\|im_start\|>|<\|endoftext\|>|"
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
-    r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
-    r"</?tool_call>|</?tool_call_reasoning>"
+    r"\[e~\[|\]~b\][a-z]*|\]~!b\["
 )
 
 
