@@ -79,6 +79,8 @@ def draft_n_tokens(
         y = sampler(logprobs)
         mx.eval(y)
         draft_tokens.append(y.item())
+        # Reshape for next model call: (1, 1)
+        y = y.reshape(1, 1) if y.ndim < 2 else y[:, None] if y.ndim == 1 else y
 
     return draft_tokens
 

@@ -112,6 +112,21 @@ def serve_command(args):
         print("  Reasoning: Use --reasoning-parser to enable")
     print("=" * 60)
 
+    # Speculative decoding validation (before any downloads)
+    if getattr(args, "speculative_draft_model", None):
+        if args.continuous_batching:
+            print(
+                "ERROR: --speculative-draft-model is incompatible with "
+                "--continuous-batching. Use simple mode (omit --continuous-batching)."
+            )
+            sys.exit(1)
+        if args.enable_mtp:
+            print(
+                "ERROR: --speculative-draft-model is incompatible with "
+                "--enable-mtp. They both patch the generation step."
+            )
+            sys.exit(1)
+
     # Pre-download model with retry/timeout
     from .api.utils import is_mllm_model
     from .utils.download import DownloadConfig, ensure_model_downloaded
@@ -214,20 +229,8 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
-    # Speculative decoding validation
-    if args.speculative_draft_model:
-        if args.continuous_batching:
-            print(
-                "ERROR: --speculative-draft-model is incompatible with "
-                "--continuous-batching. Use simple mode (omit --continuous-batching)."
-            )
-            sys.exit(1)
-        if args.enable_mtp:
-            print(
-                "ERROR: --speculative-draft-model is incompatible with "
-                "--enable-mtp. They both patch the generation step."
-            )
-            sys.exit(1)
+    # Speculative decoding info (validation already done above)
+    if getattr(args, "speculative_draft_model", None):
         print(
             f"Speculative decoding: draft={args.speculative_draft_model}, "
             f"num_draft={args.speculative_num_draft}, "
