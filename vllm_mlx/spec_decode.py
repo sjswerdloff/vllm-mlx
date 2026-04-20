@@ -39,7 +39,8 @@ def prefill_model(model, tokens: mx.array, cache: list, chunk_size: int = 2048):
     seq_len = tokens.shape[1]
 
     if seq_len <= chunk_size:
-        logits = model(tokens, cache=cache)
+        output = model(tokens, cache=cache)
+        logits = output.logits if hasattr(output, "logits") else output
         mx.eval(logits)
         mx.eval([c.state for c in cache if hasattr(c, "state")])
         return logits[0, -1, :]
@@ -47,7 +48,8 @@ def prefill_model(model, tokens: mx.array, cache: list, chunk_size: int = 2048):
     # Chunked prefill for long prompts
     for i in range(0, seq_len, chunk_size):
         chunk = tokens[:, i : i + chunk_size]
-        logits = model(chunk, cache=cache)
+        output = model(chunk, cache=cache)
+        logits = output.logits if hasattr(output, "logits") else output
         mx.eval(logits)
         mx.eval([c.state for c in cache if hasattr(c, "state")])
 
@@ -73,7 +75,8 @@ def draft_n_tokens(
     y = mx.array([[last_token]])
 
     for _ in range(n):
-        logits = draft_model(y, cache=draft_cache)
+        output = draft_model(y, cache=draft_cache)
+        logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         y = sampler(logprobs)
@@ -119,7 +122,8 @@ def verify_and_accept(
 
     # Run all draft tokens through target in one forward pass
     verify_input = mx.array([draft_tokens])  # shape (1, N)
-    verify_logits = target_model(verify_input, cache=target_cache)  # (1, N, V)
+    verify_output = target_model(verify_input, cache=target_cache)
+    verify_logits = verify_output.logits if hasattr(verify_output, "logits") else verify_output  # (1, N, V)
     mx.eval(verify_logits)
 
     # Accept tokens sequentially
@@ -139,7 +143,9 @@ def verify_and_accept(
                 break
         else:
             # Probability threshold verification
-            probs = mx.softmax(check_logits)
+            logits_1d = check_logits.reshape(-1)
+            probs = mx.softmax(logits_1d)
+            mx.eval(probs)
             if probs[draft_tokens[i]].item() >= p_min:
                 n_accepted += 1
             else:
@@ -169,7 +175,8 @@ def verify_and_accept(
 
     # Advance target cache with bonus token to get next-round logits
     bonus_input = mx.array([[bonus_token_id]])
-    next_logits = target_model(bonus_input, cache=target_cache)
+    bonus_output = target_model(bonus_input, cache=target_cache)
+    next_logits = bonus_output.logits if hasattr(bonus_output, "logits") else bonus_output
     next_logits = next_logits[:, -1, :]
     mx.eval(next_logits)
 
@@ -204,5 +211,8 @@ def sync_draft_cache(
     # Re-advance draft cache with accepted tokens in one pass
     if accepted_tokens:
         sync_input = mx.array([accepted_tokens])  # (1, n_accepted + 1)
-        draft_model(sync_input, cache=draft_cache)
+        output = draft_model(sync_input, cache=draft_cache)
+        # Force eval to ensure cache is updated
+        logits = output.logits if hasattr(output, "logits") else output
+        mx.eval(logits)
         mx.eval([c.state for c in draft_cache if hasattr(c, "state")])

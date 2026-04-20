@@ -221,8 +221,6 @@ class SimpleEngine(BaseEngine):
         # Load speculative decoding draft model
         if self._speculative_draft_model_path:
             try:
-                from mlx_lm import load as mlx_lm_load
-
                 # Reuse specprefill draft model if same path
                 if (
                     self._draft_model is not None
@@ -234,11 +232,26 @@ class SimpleEngine(BaseEngine):
                         "Speculative decode: reusing SpecPrefill draft model"
                     )
                 else:
-                    spec_model, spec_tokenizer = mlx_lm_load(
-                        self._speculative_draft_model_path
-                    )
+                    # Try mlx-vlm first (supports gemma4, qwen3.5, etc.)
+                    # Fall back to mlx-lm for older model types
+                    try:
+                        from mlx_vlm import load as mlx_vlm_load
+                        spec_model, spec_processor = mlx_vlm_load(
+                            self._speculative_draft_model_path
+                        )
+                        spec_tokenizer = getattr(
+                            spec_processor, "tokenizer", spec_processor
+                        )
+                    except Exception:
+                        from mlx_lm import load as mlx_lm_load
+                        spec_model, spec_tokenizer = mlx_lm_load(
+                            self._speculative_draft_model_path
+                        )
                     # Validate tokenizer compatibility
-                    target_vocab = self._model.tokenizer.vocab_size
+                    target_tokenizer = getattr(
+                        self._model, "tokenizer", None
+                    ) or self._model.get_tokenizer()
+                    target_vocab = target_tokenizer.vocab_size
                     draft_vocab = spec_tokenizer.vocab_size
                     if target_vocab != draft_vocab:
                         raise RuntimeError(
@@ -392,7 +405,7 @@ class SimpleEngine(BaseEngine):
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
 
         # Speculative decoding with external draft model
-        if not self._is_mllm and self._speculative_draft_model is not None:
+        if self._speculative_draft_model is not None:
             tokenizer = self._model.tokenizer
             add_special = tokenizer.bos_token is None or not prompt.startswith(
                 tokenizer.bos_token
@@ -540,6 +553,31 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        # Speculative decoding: route through stream_chat to hit the spec decode path
+        # (same pattern as tools workaround below)
+        logger.info(f"[chat] spec_draft_model={self._speculative_draft_model is not None}, path={self._speculative_draft_model_path}")
+        if self._speculative_draft_model is not None:
+            final_output = GenerationOutput(text="")
+            async for output in self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **kwargs,
+            ):
+                final_output = output
+            text = clean_output_text(final_output.text)
+            return GenerationOutput(
+                text=text,
+                tokens=list(final_output.tokens) if final_output.tokens else [],
+                prompt_tokens=final_output.prompt_tokens,
+                completion_tokens=final_output.completion_tokens,
+                finish_reason=final_output.finish_reason,
+            )
+
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
         # local models, while the streaming path completes normally. Reuse the
         # streaming implementation and aggregate its final state so both chat
@@ -647,6 +685,31 @@ class SimpleEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+
+        # Speculative decoding: intercept before MLLM/LLM routing
+        if self._speculative_draft_model is not None:
+            # Apply chat template to get prompt text
+            tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
+            if hasattr(tokenizer, "apply_chat_template"):
+                prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                prompt = "\n".join(
+                    f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
+                )
+            tokens_list = tokenizer.encode(prompt)
+            async for output in self._stream_generate_speculative(
+                prompt,
+                tokens_list,
+                max_tokens,
+                temperature,
+                top_p,
+                stop=kwargs.pop("stop", None),
+                **kwargs,
+            ):
+                yield output
+            return
 
         # Per-request routing: text-only through mlx_lm with MTP
         if (
@@ -955,7 +1018,7 @@ class SimpleEngine(BaseEngine):
 
         target_model = self._model.model
         draft_model = self._speculative_draft_model
-        tokenizer = self._model.tokenizer
+        tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
         n_draft = self._speculative_num_draft
         p_min = self._speculative_p_min
 
