@@ -1,11 +1,14 @@
 """Integration tests for Anthropic API with vision and tool calling.
 
 Exercises the full Claude Code flow: text, tools, tool results with images,
-and multi-turn conversations. Requires a running VLM server on port 8895.
+and multi-turn conversations. Requires a running server.
 
 Usage:
     cd ~/ai/vllm-mlx/vllm-mlx-test
-    uv run pytest tests/test_anthropic_vision_tools.py -v -s
+    # Default (port 8000):
+    uv run pytest tests/test_anthropic_vision_tools.py -v -s --server-url http://localhost:8000
+    # Custom port:
+    uv run pytest tests/test_anthropic_vision_tools.py -v -s --server-url http://localhost:8895
 
 Author: Clement (clement-7074f29f)
 """
@@ -17,7 +20,6 @@ from pathlib import Path
 import anthropic
 import pytest
 
-SERVER_URL = "http://localhost:8895"
 MODEL = "Qwopus3.5-27B-v3-mxfp8-vlm"
 IMAGE_PATH = Path(
     "~/ai/ClaudeInstanceHomeOffices/qwopus-3527b/webcam_snapshot.jpg"
@@ -50,8 +52,8 @@ SAMPLE_TOOLS = [
 
 
 @pytest.fixture
-def client():
-    return anthropic.Anthropic(base_url=SERVER_URL, api_key="dummy")
+def client(server_url):
+    return anthropic.Anthropic(base_url=server_url, api_key="dummy")
 
 
 @pytest.fixture
