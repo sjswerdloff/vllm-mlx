@@ -177,13 +177,35 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     # Content is a list of blocks
     messages = []
-    text_parts = []
+    # content_parts preserves ordering of text and images for multimodal messages
+    content_parts = []
+    has_images = False
     tool_calls_for_assistant = []
     tool_results = []
 
     for block in msg.content:
         if block.type == "text":
-            text_parts.append(block.text or "")
+            content_parts.append({"type": "text", "text": block.text or ""})
+
+        elif block.type == "image":
+            # Anthropic image → OpenAI image_url
+            # Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+            # OpenAI:    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+            source = block.source or {}
+            if source.get("type") == "base64":
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
+                })
+                has_images = True
+            elif source.get("type") == "url":
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": source.get("url", "")},
+                })
+                has_images = True
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -223,6 +245,8 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
             )
 
     # Build the messages
+    text_parts = [p["text"] for p in content_parts if p["type"] == "text"]
+
     if msg.role == "assistant":
         combined_text = "\n".join(text_parts) if text_parts else None
         if tool_calls_for_assistant:
@@ -238,16 +262,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
         else:
             messages.append(Message(role="assistant", content=""))
     elif msg.role == "user":
-        # User messages: collect text parts, then add tool results separately
-        if text_parts:
+        if has_images:
+            # Multimodal: preserve content_parts list (text + images in order)
+            messages.append(Message(role="user", content=content_parts))
+        elif text_parts:
             combined_text = "\n".join(text_parts)
             messages.append(Message(role="user", content=combined_text))
 
         # Tool results become separate tool messages
         messages.extend(tool_results)
 
-        # If no text and no tool results, add empty user message
-        if not text_parts and not tool_results:
+        # If no content and no tool results, add empty user message
+        if not content_parts and not tool_results:
             messages.append(Message(role="user", content=""))
     else:
         # Other roles
