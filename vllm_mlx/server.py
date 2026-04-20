@@ -1805,10 +1805,15 @@ async def create_anthropic_message(
         )
 
     # Non-streaming: run inference through existing engine
-    messages, images, videos = extract_multimodal_content(
-        openai_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
-    )
+    if engine.is_mllm:
+        # MLLM: keep images inside messages (engine.chat extracts them internally)
+        messages = [m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
+                    for m in openai_request.messages]
+    else:
+        messages, images, videos = extract_multimodal_content(
+            openai_request.messages,
+            preserve_native_format=engine.preserve_native_tool_format,
+        )
     messages = _normalize_messages(messages)
 
     chat_kwargs = {
@@ -2052,10 +2057,15 @@ async def _stream_anthropic_messages(
     start_time = time.perf_counter()
 
     # Extract messages for engine
-    messages, images, videos = extract_multimodal_content(
-        openai_request.messages,
-        preserve_native_format=engine.preserve_native_tool_format,
-    )
+    if engine.is_mllm:
+        # MLLM: keep images inside messages (engine.stream_chat extracts them internally)
+        messages = [m.model_dump() if hasattr(m, "model_dump") else m
+                    for m in openai_request.messages]
+    else:
+        messages, images, videos = extract_multimodal_content(
+            openai_request.messages,
+            preserve_native_format=engine.preserve_native_tool_format,
+        )
     messages = _normalize_messages(messages)
 
     chat_kwargs = {
