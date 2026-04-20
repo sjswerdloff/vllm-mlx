@@ -809,10 +809,30 @@ class MLLMBatchGenerator:
         total = input_ids.shape[1]
         step = self.prefill_step_size
 
+        # Pre-compute M-RoPE position IDs for the full sequence.
+        # Qwen3.5 uses 3D position encoding (temporal, height, width) that
+        # must be computed once for the full sequence and sliced per chunk.
+        # Without this, the language model's internal position_ids cache
+        # produces wrong-sized slices during chunked prefill.
+        full_position_ids = None
+        if hasattr(self.language_model, "get_rope_index"):
+            try:
+                full_position_ids, rope_deltas = self.language_model.get_rope_index(
+                    input_ids, None, None, None
+                )
+                # Cache rope_deltas for decode phase
+                self.language_model._rope_deltas = rope_deltas
+                self.language_model._position_ids = full_position_ids
+            except Exception:
+                pass  # Fall back to language model's internal computation
+
         # Short prompt — process in one shot (no chunking overhead)
         if total <= step:
             self._prefill_progress[request.request_id] = (total, total)
-            output = self.language_model(input_ids, cache=cache)
+            kwargs = {}
+            if full_position_ids is not None:
+                kwargs["position_ids"] = full_position_ids
+            output = self.language_model(input_ids, cache=cache, **kwargs)
             request.vision_encoded = True
             if hasattr(output, "logits"):
                 return output.logits
@@ -832,7 +852,12 @@ class MLLMBatchGenerator:
                 raise PrefillAbortedError(request.request_id)
 
             chunk = input_ids[:, processed : processed + step]
-            self.language_model(chunk, cache=cache)
+            kwargs = {}
+            if full_position_ids is not None:
+                kwargs["position_ids"] = full_position_ids[
+                    :, :, processed : processed + step
+                ]
+            self.language_model(chunk, cache=cache, **kwargs)
             mx.eval([c.state for c in cache])
             processed += step
             chunk_count += 1
