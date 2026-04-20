@@ -11,6 +11,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
+import mlx.core as mx
+
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, is_mllm_model
 from .base import BaseEngine, GenerationOutput
@@ -61,6 +63,9 @@ class SimpleEngine(BaseEngine):
         specprefill_threshold: int = 8192,
         specprefill_keep_pct: float = 0.3,
         specprefill_draft_model: str | None = None,
+        speculative_draft_model: str | None = None,
+        speculative_num_draft: int = 16,
+        speculative_p_min: float = 0.0,
     ):
         """
         Initialize the simple engine.
@@ -76,6 +81,9 @@ class SimpleEngine(BaseEngine):
             specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill
             specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
             specprefill_draft_model: Path to small draft model for importance scoring
+            speculative_draft_model: Path to external draft model for speculative decoding
+            speculative_num_draft: Max draft tokens per round (default: 16)
+            speculative_p_min: Min target probability to accept (default: 0.0)
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -89,6 +97,12 @@ class SimpleEngine(BaseEngine):
         self._specprefill_threshold = specprefill_threshold
         self._specprefill_keep_pct = specprefill_keep_pct
         self._specprefill_draft_model_path = specprefill_draft_model
+
+        # Speculative decoding config
+        self._speculative_draft_model_path = speculative_draft_model
+        self._speculative_num_draft = speculative_num_draft
+        self._speculative_p_min = speculative_p_min
+        self._speculative_draft_model = None
 
         self._model = None
         self._loaded = False
@@ -203,6 +217,45 @@ class SimpleEngine(BaseEngine):
             except Exception as e:
                 logger.error("SpecPrefill: draft model load failed: %s", e)
                 self._draft_model = None
+
+        # Load speculative decoding draft model
+        if self._speculative_draft_model_path:
+            try:
+                from mlx_lm import load as mlx_lm_load
+
+                # Reuse specprefill draft model if same path
+                if (
+                    self._draft_model is not None
+                    and self._specprefill_draft_model_path
+                    == self._speculative_draft_model_path
+                ):
+                    self._speculative_draft_model = self._draft_model
+                    logger.info(
+                        "Speculative decode: reusing SpecPrefill draft model"
+                    )
+                else:
+                    spec_model, spec_tokenizer = mlx_lm_load(
+                        self._speculative_draft_model_path
+                    )
+                    # Validate tokenizer compatibility
+                    target_vocab = self._model.tokenizer.vocab_size
+                    draft_vocab = spec_tokenizer.vocab_size
+                    if target_vocab != draft_vocab:
+                        raise RuntimeError(
+                            f"Tokenizer mismatch: target vocab={target_vocab}, "
+                            f"draft vocab={draft_vocab}. Models must share tokenizer."
+                        )
+                    self._speculative_draft_model = spec_model
+                    logger.info(
+                        "Speculative decode: draft model loaded (%s), "
+                        "num_draft=%d, p_min=%.2f",
+                        self._speculative_draft_model_path,
+                        self._speculative_num_draft,
+                        self._speculative_p_min,
+                    )
+            except Exception as e:
+                logger.error("Speculative decode: draft model load failed: %s", e)
+                self._speculative_draft_model = None
 
         mtp_info = f", MTP={self._mtp}" if self._mtp else ""
         routing = ", routing=per-request" if self._text_model is not None else ""
@@ -337,6 +390,25 @@ class SimpleEngine(BaseEngine):
         # Per-request specprefill overrides (from extra_body)
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct_override = kwargs.pop("specprefill_keep_pct", None)
+
+        # Speculative decoding with external draft model
+        if not self._is_mllm and self._speculative_draft_model is not None:
+            tokenizer = self._model.tokenizer
+            add_special = tokenizer.bos_token is None or not prompt.startswith(
+                tokenizer.bos_token
+            )
+            tokens_list = tokenizer.encode(prompt, add_special_tokens=add_special)
+            async for output in self._stream_generate_speculative(
+                prompt,
+                tokens_list,
+                max_tokens,
+                temperature,
+                top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                yield output
+            return
 
         # SpecPrefill for non-MLLM models (MLLM+MTP handles it in _stream_generate_text)
         if not self._is_mllm and self._draft_model is not None:
@@ -852,6 +924,149 @@ class SimpleEngine(BaseEngine):
                 completion_tokens=token_count,
                 finished=True,
                 finish_reason="length",
+            )
+
+    async def _stream_generate_speculative(
+        self,
+        prompt: str,
+        tokens_list: list[int],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Stream generation using external draft model speculative decoding.
+
+        Draft model generates N tokens, target verifies in one pass, accepts
+        up to first mismatch, emits accepted tokens + bonus.
+        """
+        import asyncio
+
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_sampler
+
+        from ..spec_decode import (
+            draft_n_tokens,
+            prefill_model,
+            sync_draft_cache,
+            verify_and_accept,
+        )
+
+        target_model = self._model.model
+        draft_model = self._speculative_draft_model
+        tokenizer = self._model.tokenizer
+        n_draft = self._speculative_num_draft
+        p_min = self._speculative_p_min
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+
+        # Build KV caches for both models
+        target_cache = make_prompt_cache(target_model)
+        draft_cache = make_prompt_cache(draft_model)
+
+        n_prompt_tokens = len(tokens_list)
+        prompt_arr = mx.array([tokens_list])
+
+        # Prefill both models
+        target_logits = prefill_model(
+            target_model, prompt_arr, target_cache, self._prefill_step_size
+        )
+        prefill_model(draft_model, prompt_arr, draft_cache, self._prefill_step_size)
+
+        # Get stop token IDs
+        stop_ids = set()
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            stop_ids.add(tokenizer.eos_token_id)
+
+        # Generation loop
+        generated_ids = []
+        prev_decoded = tokenizer.decode(tokens_list)
+        total_accepted = 0
+        total_proposed = 0
+
+        while len(generated_ids) < max_tokens:
+            # Determine last token for draft model input
+            last_token = (
+                generated_ids[-1] if generated_ids else tokens_list[-1]
+            )
+
+            # Draft N tokens
+            n_this_round = min(n_draft, max_tokens - len(generated_ids))
+            drafts = draft_n_tokens(
+                draft_model, draft_cache, last_token, n_this_round, sampler
+            )
+
+            # Verify and accept
+            accepted_tokens, target_logits = verify_and_accept(
+                target_model,
+                target_cache,
+                drafts,
+                target_logits,
+                sampler,
+                p_min,
+            )
+
+            # Sync draft cache
+            sync_draft_cache(
+                draft_model, draft_cache, accepted_tokens, len(drafts)
+            )
+
+            # Stats
+            total_proposed += len(drafts)
+            total_accepted += len(accepted_tokens) - 1  # exclude bonus
+
+            # Emit accepted tokens
+            finished = False
+            for tok_id in accepted_tokens:
+                generated_ids.append(tok_id)
+
+                # Check stop
+                if tok_id in stop_ids:
+                    finished = True
+                    break
+
+                # Check max_tokens
+                if len(generated_ids) >= max_tokens:
+                    finished = True
+                    break
+
+            # Decode and yield
+            full_decoded = tokenizer.decode(tokens_list + generated_ids)
+            new_text = full_decoded[len(prev_decoded):]
+            prev_decoded = full_decoded
+
+            finish_reason = None
+            if finished:
+                if generated_ids[-1] in stop_ids:
+                    finish_reason = "stop"
+                else:
+                    finish_reason = "length"
+
+            yield GenerationOutput(
+                text=full_decoded[len(tokenizer.decode(tokens_list)):],
+                new_text=new_text,
+                prompt_tokens=n_prompt_tokens,
+                completion_tokens=len(generated_ids),
+                finished=finished or len(generated_ids) >= max_tokens,
+                finish_reason=finish_reason,
+            )
+
+            if finished:
+                break
+
+            # Yield to event loop
+            await asyncio.sleep(0)
+
+        # Log acceptance stats
+        if total_proposed > 0:
+            acceptance_pct = total_accepted / total_proposed * 100
+            logger.info(
+                "[spec_decode] %d tokens generated, acceptance=%d/%d (%.1f%%)",
+                len(generated_ids),
+                total_accepted,
+                total_proposed,
+                acceptance_pct,
             )
 
     async def _stream_generate_text(

@@ -214,6 +214,26 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
+    # Speculative decoding validation
+    if args.speculative_draft_model:
+        if args.continuous_batching:
+            print(
+                "ERROR: --speculative-draft-model is incompatible with "
+                "--continuous-batching. Use simple mode (omit --continuous-batching)."
+            )
+            sys.exit(1)
+        if args.enable_mtp:
+            print(
+                "ERROR: --speculative-draft-model is incompatible with "
+                "--enable-mtp. They both patch the generation step."
+            )
+            sys.exit(1)
+        print(
+            f"Speculative decoding: draft={args.speculative_draft_model}, "
+            f"num_draft={args.speculative_num_draft}, "
+            f"p_min={args.speculative_p_min}"
+        )
+
     # Load model with unified server
     load_model(
         args.model,
@@ -230,6 +250,9 @@ def serve_command(args):
         specprefill_threshold=args.specprefill_threshold,
         specprefill_keep_pct=args.specprefill_keep_pct,
         specprefill_draft_model=args.specprefill_draft_model,
+        speculative_draft_model=args.speculative_draft_model,
+        speculative_num_draft=args.speculative_num_draft,
+        speculative_p_min=args.speculative_p_min,
     )
 
     # Start server
@@ -847,6 +870,30 @@ Examples:
         default=None,
         help="Path to small draft model for SpecPrefill importance scoring. "
         "Must share the same tokenizer as the target model.",
+    )
+    # Speculative Decoding (external draft model)
+    serve_parser.add_argument(
+        "--speculative-draft-model",
+        type=str,
+        default=None,
+        help="Path to external draft model for speculative decoding. "
+        "Must share the same tokenizer as the target model. "
+        "Incompatible with --continuous-batching and --enable-mtp.",
+    )
+    serve_parser.add_argument(
+        "--speculative-num-draft",
+        type=int,
+        default=16,
+        help="Max draft tokens per speculative decoding round (default: 16). "
+        "Higher values improve throughput when acceptance rate is high.",
+    )
+    serve_parser.add_argument(
+        "--speculative-p-min",
+        type=float,
+        default=0.0,
+        help="Min target probability to accept a draft token (default: 0.0 = greedy). "
+        "Set to 0.0 for greedy verification (argmax must match). "
+        "Set > 0.0 for probability threshold verification.",
     )
     # MCP options
     serve_parser.add_argument(

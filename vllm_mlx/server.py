@@ -560,6 +560,9 @@ def load_model(
     specprefill_threshold: int = 8192,
     specprefill_keep_pct: float = 0.3,
     specprefill_draft_model: str = None,
+    speculative_draft_model: str = None,
+    speculative_num_draft: int = 16,
+    speculative_p_min: float = 0.0,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -577,6 +580,9 @@ def load_model(
         specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
         specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
         specprefill_draft_model: Path to small draft model for SpecPrefill scoring
+        speculative_draft_model: Path to external draft model for speculative decoding
+        speculative_num_draft: Max draft tokens per round (default: 16)
+        speculative_p_min: Min target probability to accept (default: 0.0)
     """
     global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
 
@@ -612,6 +618,9 @@ def load_model(
             specprefill_threshold=specprefill_threshold,
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
+            speculative_draft_model=speculative_draft_model,
+            speculative_num_draft=speculative_num_draft,
+            speculative_p_min=speculative_p_min,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
