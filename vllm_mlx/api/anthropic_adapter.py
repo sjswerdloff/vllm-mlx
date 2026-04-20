@@ -224,12 +224,23 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
         elif block.type == "tool_result":
             # Tool result → OpenAI tool message
             result_content = block.content
+            tool_result_images = []
             if isinstance(result_content, list):
-                # Extract text from content blocks
+                # Extract text and images from content blocks
                 parts = []
                 for item in result_content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         parts.append(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        # Anthropic image in tool result → save for injection
+                        source = item.get("source", {})
+                        if source.get("type") == "base64":
+                            media_type = source.get("media_type", "image/jpeg")
+                            data = source.get("data", "")
+                            tool_result_images.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"},
+                            })
                     elif isinstance(item, str):
                         parts.append(item)
                 result_content = "\n".join(parts)
@@ -243,6 +254,16 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                     tool_call_id=block.tool_use_id or "",
                 )
             )
+
+            # Images in tool results: OpenAI tool messages don't support
+            # multimodal content, so inject as a follow-up user message.
+            if tool_result_images:
+                image_parts = tool_result_images + [
+                    {"type": "text", "text": "[Image from tool result]"},
+                ]
+                tool_results.append(
+                    Message(role="user", content=image_parts)
+                )
 
     # Build the messages
     text_parts = [p["text"] for p in content_parts if p["type"] == "text"]
