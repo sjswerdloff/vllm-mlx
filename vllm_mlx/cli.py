@@ -127,6 +127,24 @@ def serve_command(args):
             )
             sys.exit(1)
 
+    # EAGLE3 validation
+    if getattr(args, "eagle3_head", None):
+        if args.continuous_batching:
+            print(
+                "ERROR: --eagle3-head is incompatible with "
+                "--continuous-batching. Use simple mode."
+            )
+            sys.exit(1)
+        if args.enable_mtp:
+            print("ERROR: --eagle3-head is incompatible with --enable-mtp.")
+            sys.exit(1)
+        if getattr(args, "speculative_draft_model", None):
+            print(
+                "ERROR: --eagle3-head is incompatible with "
+                "--speculative-draft-model. Use one or the other."
+            )
+            sys.exit(1)
+
     # Pre-download model with retry/timeout
     from .api.utils import is_mllm_model
     from .utils.download import DownloadConfig, ensure_model_downloaded
@@ -256,6 +274,7 @@ def serve_command(args):
         speculative_draft_model=args.speculative_draft_model,
         speculative_num_draft=args.speculative_num_draft,
         speculative_p_min=args.speculative_p_min,
+        eagle3_head=getattr(args, "eagle3_head", None),
     )
 
     # Start server
@@ -897,6 +916,15 @@ Examples:
         help="Min target probability to accept a draft token (default: 0.0 = greedy). "
         "Set to 0.0 for greedy verification (argmax must match). "
         "Set > 0.0 for probability threshold verification.",
+    )
+    # EAGLE3 Speculative Decoding (draft head using target hidden states)
+    serve_parser.add_argument(
+        "--eagle3-head",
+        type=str,
+        default=None,
+        help="Path to EAGLE3 draft head model for speculative decoding. "
+        "Uses target model's intermediate hidden states for high-acceptance drafting. "
+        "Incompatible with --continuous-batching, --enable-mtp, --speculative-draft-model.",
     )
     # MCP options
     serve_parser.add_argument(

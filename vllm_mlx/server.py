@@ -563,6 +563,7 @@ def load_model(
     speculative_draft_model: str = None,
     speculative_num_draft: int = 16,
     speculative_p_min: float = 0.0,
+    eagle3_head: str = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -621,6 +622,7 @@ def load_model(
             speculative_draft_model=speculative_draft_model,
             speculative_num_draft=speculative_num_draft,
             speculative_p_min=speculative_p_min,
+            eagle3_head=eagle3_head,
         )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)

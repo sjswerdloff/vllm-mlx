@@ -66,6 +66,7 @@ class SimpleEngine(BaseEngine):
         speculative_draft_model: str | None = None,
         speculative_num_draft: int = 16,
         speculative_p_min: float = 0.0,
+        eagle3_head: str | None = None,
     ):
         """
         Initialize the simple engine.
@@ -103,6 +104,9 @@ class SimpleEngine(BaseEngine):
         self._speculative_num_draft = speculative_num_draft
         self._speculative_p_min = speculative_p_min
         self._speculative_draft_model = None
+
+        # EAGLE3 config
+        self._eagle3_head_path = eagle3_head
 
         self._model = None
         self._loaded = False
@@ -269,6 +273,22 @@ class SimpleEngine(BaseEngine):
             except Exception as e:
                 logger.error("Speculative decode: draft model load failed: %s", e)
                 self._speculative_draft_model = None
+
+        # Inject EAGLE3 head into the language model
+        if self._eagle3_head_path:
+            try:
+                from ..patches.gemma4_eagle3 import inject_eagle3
+
+                # Get the language model from the MLLM wrapper
+                lang_model = getattr(self._model, "language_model", self._model)
+                inject_eagle3(lang_model, self._eagle3_head_path)
+                logger.info(
+                    "EAGLE3: head injected, num_draft=%d, p_min=%.2f",
+                    self._speculative_num_draft,
+                    self._speculative_p_min,
+                )
+            except Exception as e:
+                logger.error("EAGLE3: injection failed: %s", e)
 
         mtp_info = f", MTP={self._mtp}" if self._mtp else ""
         routing = ", routing=per-request" if self._text_model is not None else ""
@@ -686,7 +706,33 @@ class SimpleEngine(BaseEngine):
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
-        # Speculative decoding: intercept before MLLM/LLM routing
+        # EAGLE3 speculative decoding: intercept before MLLM/LLM routing
+        if hasattr(self._model, "language_model") and hasattr(
+            getattr(self._model, "language_model", None), "eagle3"
+        ):
+            tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
+            if hasattr(tokenizer, "apply_chat_template"):
+                prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                prompt = "\n".join(
+                    f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
+                )
+            tokens_list = tokenizer.encode(prompt)
+            async for output in self._stream_generate_eagle3(
+                prompt,
+                tokens_list,
+                max_tokens,
+                temperature,
+                top_p,
+                stop=kwargs.pop("stop", None),
+                **kwargs,
+            ):
+                yield output
+            return
+
+        # External draft model speculative decoding
         if self._speculative_draft_model is not None:
             # Apply chat template to get prompt text
             tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
@@ -1126,6 +1172,137 @@ class SimpleEngine(BaseEngine):
             acceptance_pct = total_accepted / total_proposed * 100
             logger.info(
                 "[spec_decode] %d tokens generated, acceptance=%d/%d (%.1f%%)",
+                len(generated_ids),
+                total_accepted,
+                total_proposed,
+                acceptance_pct,
+            )
+
+    async def _stream_generate_eagle3(
+        self,
+        prompt: str,
+        tokens_list: list[int],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """Stream generation using EAGLE3 draft head speculative decoding.
+
+        The EAGLE3 head uses hidden states captured from the target model's
+        intermediate layers to predict draft tokens with high acceptance.
+        """
+        import asyncio
+
+        from mlx_lm.models.cache import make_prompt_cache
+        from mlx_lm.sample_utils import make_sampler
+
+        from ..spec_decode import (
+            eagle3_draft_n_tokens,
+            eagle3_verify_and_accept,
+            prefill_model,
+        )
+
+        # Get the language model (which has been patched with EAGLE3)
+        lang_model = self._model.language_model
+        tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
+        n_draft = self._speculative_num_draft
+        p_min = self._speculative_p_min
+
+        sampler = make_sampler(temp=temperature, top_p=top_p)
+
+        # Build target KV cache
+        target_cache = make_prompt_cache(lang_model)
+
+        n_prompt_tokens = len(tokens_list)
+        prompt_arr = mx.array([tokens_list])
+
+        # Prefill target model (this also captures hidden states for EAGLE3)
+        target_logits = prefill_model(
+            lang_model, prompt_arr, target_cache, self._prefill_step_size
+        )
+
+        # Get stop token IDs
+        stop_ids = set()
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            stop_ids.add(tokenizer.eos_token_id)
+
+        # Generation loop
+        generated_ids = []
+        prev_decoded = tokenizer.decode(tokens_list)
+        total_accepted = 0
+        total_proposed = 0
+        eagle3_cache = None
+
+        while len(generated_ids) < max_tokens:
+            last_token = generated_ids[-1] if generated_ids else tokens_list[-1]
+
+            # Draft N tokens using EAGLE3 head
+            n_this_round = min(n_draft, max_tokens - len(generated_ids))
+            drafts, eagle3_cache = eagle3_draft_n_tokens(
+                lang_model, last_token, n_this_round, sampler, eagle3_cache
+            )
+
+            # Verify (also captures new hidden states for next round)
+            accepted_tokens, target_logits = eagle3_verify_and_accept(
+                lang_model,
+                target_cache,
+                drafts,
+                target_logits,
+                sampler,
+                p_min,
+            )
+
+            # Reset EAGLE3 cache after verify (hidden states changed)
+            eagle3_cache = None
+
+            # Stats
+            total_proposed += len(drafts)
+            total_accepted += len(accepted_tokens) - 1  # exclude bonus
+
+            # Emit accepted tokens
+            finished = False
+            for tok_id in accepted_tokens:
+                generated_ids.append(tok_id)
+                if tok_id in stop_ids:
+                    finished = True
+                    break
+                if len(generated_ids) >= max_tokens:
+                    finished = True
+                    break
+
+            # Decode and yield
+            full_decoded = tokenizer.decode(tokens_list + generated_ids)
+            new_text = full_decoded[len(prev_decoded):]
+            prev_decoded = full_decoded
+
+            finish_reason = None
+            if finished:
+                if generated_ids[-1] in stop_ids:
+                    finish_reason = "stop"
+                else:
+                    finish_reason = "length"
+
+            yield GenerationOutput(
+                text=full_decoded[len(tokenizer.decode(tokens_list)):],
+                new_text=new_text,
+                prompt_tokens=n_prompt_tokens,
+                completion_tokens=len(generated_ids),
+                finished=finished or len(generated_ids) >= max_tokens,
+                finish_reason=finish_reason,
+            )
+
+            if finished:
+                break
+
+            await asyncio.sleep(0)
+
+        # Log acceptance stats
+        if total_proposed > 0:
+            acceptance_pct = total_accepted / total_proposed * 100
+            logger.info(
+                "[eagle3_spec_decode] %d tokens generated, acceptance=%d/%d (%.1f%%)",
                 len(generated_ids),
                 total_accepted,
                 total_proposed,
