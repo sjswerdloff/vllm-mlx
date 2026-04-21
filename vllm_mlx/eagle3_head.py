@@ -78,12 +78,16 @@ class Eagle3Attention(nn.Module):
         keys = keys.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # KV cache
+        # KV cache (store pre-GQA keys/values)
         if cache is not None:
             keys = mx.concatenate([cache[0], keys], axis=2)
             values = mx.concatenate([cache[1], values], axis=2)
 
-        # GQA: repeat KV heads
+        # Save pre-GQA for cache output
+        cached_keys = keys
+        cached_values = values
+
+        # GQA: repeat KV heads for attention computation
         if self.num_kv_heads < self.num_heads:
             repeat_factor = self.num_heads // self.num_kv_heads
             keys = mx.repeat(keys, repeat_factor, axis=1)
@@ -102,7 +106,7 @@ class Eagle3Attention(nn.Module):
 
         # Reshape back
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output), (keys, values)
+        return self.o_proj(output), (cached_keys, cached_values)
 
 
 class Eagle3MLP(nn.Module):
