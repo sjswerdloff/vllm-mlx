@@ -583,10 +583,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         # Speculative decoding: route through stream_chat to hit the spec decode path
-        _has_eagle3 = getattr(
-            getattr(self._model, "language_model", None), "eagle3", None
-        ) or getattr(self._model, "eagle3", None)
-        if self._speculative_draft_model is not None or _has_eagle3 is not None:
+        if self._speculative_draft_model is not None or self._eagle3_head_path is not None:
             final_output = GenerationOutput(text="")
             async for output in self.stream_chat(
                 messages=messages,
@@ -717,11 +714,7 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # EAGLE3 speculative decoding: intercept before MLLM/LLM routing
-        # Check both MLLM path (model.language_model.eagle3) and LLM path (model.eagle3)
-        _eagle3_model = getattr(
-            getattr(self._model, "language_model", None), "eagle3", None
-        ) or getattr(self._model, "eagle3", None)
-        if _eagle3_model is not None:
+        if self._eagle3_head_path is not None:
             tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
             if hasattr(tokenizer, "apply_chat_template"):
                 prompt = tokenizer.apply_chat_template(
