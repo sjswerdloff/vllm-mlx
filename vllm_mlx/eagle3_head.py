@@ -28,8 +28,23 @@ import mlx.nn as nn
 logger = logging.getLogger(__name__)
 
 
+def _compute_rope(x: mx.array, freqs: mx.array) -> mx.array:
+    """Apply rotary position embedding to x using precomputed frequencies."""
+    # x shape: (B, num_heads, L, head_dim)
+    # freqs shape: (L, head_dim//2)
+    head_dim = x.shape[-1]
+    x1 = x[..., : head_dim // 2]
+    x2 = x[..., head_dim // 2 :]
+    cos = mx.cos(freqs)
+    sin = mx.sin(freqs)
+    # Broadcast: freqs is (L, head_dim//2), need (1, 1, L, head_dim//2)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+
 class Eagle3Attention(nn.Module):
-    """Single attention layer for EAGLE3 head.
+    """Single attention layer for EAGLE3 head with RoPE.
 
     Takes concatenated (fc_output, token_embedding) as input to q/k projections,
     producing queries/keys in the target's hidden dimension.
@@ -41,12 +56,15 @@ class Eagle3Attention(nn.Module):
         num_heads: int = 42,
         num_kv_heads: int = 14,
         head_dim: int = 128,
+        rope_theta: float = 500000.0,
+        max_position_embeddings: int = 131072,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.rope_theta = rope_theta
 
         # q/k take concatenated input (2 * hidden_size)
         attn_input_size = 2 * hidden_size
@@ -57,46 +75,52 @@ class Eagle3Attention(nn.Module):
 
         self.scale = head_dim**-0.5
 
+        # Track position for RoPE across cached calls
+        self._position_offset = 0
+
+    def _get_rope_freqs(self, seq_len: int, offset: int = 0) -> mx.array:
+        """Compute RoPE frequency tensor."""
+        dim = self.head_dim
+        freqs = 1.0 / (
+            self.rope_theta ** (mx.arange(0, dim, 2).astype(mx.float32) / dim)
+        )
+        positions = mx.arange(offset, offset + seq_len).astype(mx.float32)
+        # (seq_len, dim//2)
+        return positions[:, None] * freqs[None, :]
+
     def __call__(self, x: mx.array, cache=None) -> mx.array:
-        """Forward pass.
-
-        Args:
-            x: (batch, seq_len, 2 * hidden_size) — concat of fc_out and token_embed
-            cache: Optional KV cache tuple (keys, values)
-
-        Returns:
-            (batch, seq_len, hidden_size)
-        """
         B, L, _ = x.shape
 
         queries = self.q_proj(x)
         keys = self.k_proj(x)
         values = self.v_proj(x)
 
-        # Reshape for multi-head attention
         queries = queries.reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # KV cache (store pre-GQA keys/values)
+        # Apply RoPE
+        offset = cache[0].shape[2] if cache is not None else 0
+        freqs = self._get_rope_freqs(L, offset)
+        queries = _compute_rope(queries, freqs)
+        keys = _compute_rope(keys, freqs)
+
+        # KV cache (store pre-GQA, post-RoPE)
         if cache is not None:
             keys = mx.concatenate([cache[0], keys], axis=2)
             values = mx.concatenate([cache[1], values], axis=2)
 
-        # Save pre-GQA for cache output
         cached_keys = keys
         cached_values = values
 
-        # GQA: repeat KV heads for attention computation
+        # GQA
         if self.num_kv_heads < self.num_heads:
             repeat_factor = self.num_heads // self.num_kv_heads
             keys = mx.repeat(keys, repeat_factor, axis=1)
             values = mx.repeat(values, repeat_factor, axis=1)
 
-        # Scaled dot-product attention
         scores = (queries @ keys.transpose(0, 1, 3, 2)) * self.scale
 
-        # Causal mask
         if L > 1:
             mask = mx.triu(mx.full((L, keys.shape[2]), float("-inf")), k=keys.shape[2] - L + 1)
             scores = scores + mask
@@ -104,7 +128,6 @@ class Eagle3Attention(nn.Module):
         weights = mx.softmax(scores, axis=-1)
         output = weights @ values
 
-        # Reshape back
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output), (cached_keys, cached_values)
 
@@ -160,11 +183,13 @@ class Eagle3Head(nn.Module):
 
         # Midlayer: transformer layer
         self.midlayer_input_layernorm = nn.RMSNorm(hidden_size)
+        rope_theta = config.get("rope_theta", 500000.0)
         self.midlayer_attn = Eagle3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            rope_theta=rope_theta,
         )
         self.midlayer_hidden_norm = nn.RMSNorm(hidden_size)
         self.midlayer_post_attention_layernorm = nn.RMSNorm(hidden_size)
@@ -356,6 +381,7 @@ def load_eagle3_head(model_path: str) -> Eagle3Head:
                 "draft_vocab_size": raw_config.get("draft_vocab_size", 32000),
                 "vocab_size": tlc.get("vocab_size", 128256),
                 "norm_before_residual": raw_config.get("norm_before_residual", False),
+                "rope_theta": tlc.get("rope_theta", 500000.0),
                 "eagle_config": raw_config.get("eagle_config", {}),
             }
         else:
