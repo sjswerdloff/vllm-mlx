@@ -277,10 +277,18 @@ class SimpleEngine(BaseEngine):
         # Inject EAGLE3 head into the language model
         if self._eagle3_head_path:
             try:
-                from ..patches.gemma4_eagle3 import inject_eagle3
-
-                # Get the language model from the MLLM wrapper
+                # Detect model type and use appropriate patch
                 lang_model = getattr(self._model, "language_model", self._model)
+                model_type = getattr(
+                    getattr(lang_model, "config", getattr(lang_model, "args", None)),
+                    "model_type", ""
+                )
+
+                if "gemma" in str(model_type).lower():
+                    from ..patches.gemma4_eagle3 import inject_eagle3
+                else:
+                    from ..patches.llama_eagle3 import inject_eagle3_llama as inject_eagle3
+
                 inject_eagle3(lang_model, self._eagle3_head_path)
                 logger.info(
                     "EAGLE3: head injected, num_draft=%d, p_min=%.2f",
@@ -707,9 +715,11 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         # EAGLE3 speculative decoding: intercept before MLLM/LLM routing
-        if hasattr(self._model, "language_model") and hasattr(
-            getattr(self._model, "language_model", None), "eagle3"
-        ):
+        # Check both MLLM path (model.language_model.eagle3) and LLM path (model.eagle3)
+        _eagle3_model = getattr(
+            getattr(self._model, "language_model", None), "eagle3", None
+        ) or getattr(self._model, "eagle3", None)
+        if _eagle3_model is not None:
             tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
             if hasattr(tokenizer, "apply_chat_template"):
                 prompt = tokenizer.apply_chat_template(
@@ -1205,7 +1215,7 @@ class SimpleEngine(BaseEngine):
         )
 
         # Get the language model (which has been patched with EAGLE3)
-        lang_model = self._model.language_model
+        lang_model = getattr(self._model, "language_model", self._model)
         tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
         n_draft = self._speculative_num_draft
         p_min = self._speculative_p_min
