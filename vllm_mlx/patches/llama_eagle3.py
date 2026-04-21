@@ -74,10 +74,24 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
         layer_ids,
     )
 
-    # Store on model
-    model.eagle3 = eagle3_head
-    model._eagle3_aux_layer_ids = layer_ids
-    model._eagle3_aux_hidden_states = None
+    # Store as plain dict to avoid MLX nn.Module submodule registration conflicts.
+    # nn.Module.__getattr__ intercepts attribute access and may interfere.
+    if not hasattr(model, "_eagle3_state"):
+        object.__setattr__(model, "_eagle3_state", {})
+    model._eagle3_state["head"] = eagle3_head
+    model._eagle3_state["aux_layer_ids"] = layer_ids
+    model._eagle3_state["aux_hidden_states"] = None
+    # Also set eagle3 for detection in routing (using object.__setattr__ to bypass nn.Module)
+    object.__setattr__(model, "eagle3", eagle3_head)
+    object.__setattr__(model, "_eagle3_aux_layer_ids", layer_ids)
+    object.__setattr__(model, "_eagle3_aux_hidden_states", None)
+    # Capture references before class swap (nn.Module __getattr__ can break after swap)
+    _inner_model = model.model  # LlamaModel
+    _args = model.args
+    _lm_head = getattr(model, "lm_head", None)
+    object.__setattr__(model, "_eagle3_inner", _inner_model)
+    object.__setattr__(model, "_eagle3_args", _args)
+    object.__setattr__(model, "_eagle3_lm_head", _lm_head)
 
     original_class = model.__class__
 
@@ -93,7 +107,7 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
             **kwargs,
         ):
             """Forward pass that captures intermediate hidden states for EAGLE3."""
-            inner = self.model
+            inner = self._eagle3_inner
 
             if input_embeddings is not None:
                 h = input_embeddings
@@ -127,10 +141,10 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
             normed = inner.norm(h)
 
             # Logit projection
-            if self.args.tie_word_embeddings:
+            if self._eagle3_args.tie_word_embeddings:
                 out = inner.embed_tokens.as_linear(normed)
             else:
-                out = self.lm_head(normed)
+                out = self._eagle3_lm_head(normed)
 
             # Store captured hidden states
             self._eagle3_aux_hidden_states = [
@@ -164,7 +178,7 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
                 )
 
             # Get token embeddings from model's embedding layer
-            token_embeds = self.model.embed_tokens(token_ids)
+            token_embeds = self._eagle3_inner.embed_tokens(token_ids)
 
             # Extract last-position hidden states
             aux_states = [

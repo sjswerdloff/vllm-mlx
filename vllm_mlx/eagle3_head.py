@@ -180,10 +180,13 @@ class Eagle3Head(nn.Module):
             self.t2d = weights.pop("t2d")
 
         # Map weight names to module structure
+        # Supports both ThoughtWorks format (midlayer.*) and speculators format (layers.0.*)
         param_map = {
+            # Common
             "fc.weight": "fc.weight",
             "norm.weight": "norm.weight",
             "lm_head.weight": "lm_head.weight",
+            # ThoughtWorks format (midlayer.*)
             "midlayer.input_layernorm.weight": "midlayer_input_layernorm.weight",
             "midlayer.post_attention_layernorm.weight": "midlayer_post_attention_layernorm.weight",
             "midlayer.hidden_norm.weight": "midlayer_hidden_norm.weight",
@@ -194,6 +197,17 @@ class Eagle3Head(nn.Module):
             "midlayer.mlp.gate_proj.weight": "midlayer_mlp.gate_proj.weight",
             "midlayer.mlp.up_proj.weight": "midlayer_mlp.up_proj.weight",
             "midlayer.mlp.down_proj.weight": "midlayer_mlp.down_proj.weight",
+            # Speculators/RedHat format (layers.0.*)
+            "layers.0.input_layernorm.weight": "midlayer_input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight": "midlayer_post_attention_layernorm.weight",
+            "layers.0.hidden_norm.weight": "midlayer_hidden_norm.weight",
+            "layers.0.self_attn.q_proj.weight": "midlayer_attn.q_proj.weight",
+            "layers.0.self_attn.k_proj.weight": "midlayer_attn.k_proj.weight",
+            "layers.0.self_attn.v_proj.weight": "midlayer_attn.v_proj.weight",
+            "layers.0.self_attn.o_proj.weight": "midlayer_attn.o_proj.weight",
+            "layers.0.mlp.gate_proj.weight": "midlayer_mlp.gate_proj.weight",
+            "layers.0.mlp.up_proj.weight": "midlayer_mlp.up_proj.weight",
+            "layers.0.mlp.down_proj.weight": "midlayer_mlp.down_proj.weight",
         }
 
         mapped_weights = {}
@@ -299,7 +313,24 @@ def load_eagle3_head(model_path: str) -> Eagle3Head:
     # Load config
     if config_path.exists():
         with open(config_path) as f:
-            config = json.load(f)
+            raw_config = json.load(f)
+
+        # Handle speculators format (RedHat) vs ThoughtWorks format
+        # Speculators nests model params under transformer_layer_config
+        if "transformer_layer_config" in raw_config:
+            tlc = raw_config["transformer_layer_config"]
+            config = {
+                "hidden_size": tlc.get("hidden_size", 8192),
+                "num_attention_heads": tlc.get("num_attention_heads", 64),
+                "num_key_value_heads": tlc.get("num_key_value_heads", 8),
+                "head_dim": tlc.get("head_dim", 128),
+                "intermediate_size": tlc.get("intermediate_size", 28672),
+                "draft_vocab_size": raw_config.get("draft_vocab_size", 32000),
+                "vocab_size": tlc.get("vocab_size", 128256),
+                "eagle_config": raw_config.get("eagle_config", {}),
+            }
+        else:
+            config = raw_config
     else:
         # Use defaults from ThoughtWorks Gemma-4-31B-Eagle3
         config = {

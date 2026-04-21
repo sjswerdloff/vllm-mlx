@@ -582,9 +582,10 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         # Speculative decoding: route through stream_chat to hit the spec decode path
-        # (same pattern as tools workaround below)
-        logger.info(f"[chat] spec_draft_model={self._speculative_draft_model is not None}, path={self._speculative_draft_model_path}")
-        if self._speculative_draft_model is not None:
+        _has_eagle3 = getattr(
+            getattr(self._model, "language_model", None), "eagle3", None
+        ) or getattr(self._model, "eagle3", None)
+        if self._speculative_draft_model is not None or _has_eagle3 is not None:
             final_output = GenerationOutput(text="")
             async for output in self.stream_chat(
                 messages=messages,
@@ -1223,7 +1224,9 @@ class SimpleEngine(BaseEngine):
         sampler = make_sampler(temp=temperature, top_p=top_p)
 
         # Build target KV cache
-        target_cache = make_prompt_cache(lang_model)
+        # make_prompt_cache expects model.layers; for wrapped models use model.model
+        cache_model = getattr(lang_model, "model", lang_model)
+        target_cache = make_prompt_cache(cache_model)
 
         n_prompt_tokens = len(tokens_list)
         prompt_arr = mx.array([tokens_list])
