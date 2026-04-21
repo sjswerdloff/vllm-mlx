@@ -192,4 +192,11 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
             return None
 
     model.__class__ = _LlamaEagle3
+
+    # Bind methods explicitly — nn.Module.__getattr__ can't find methods
+    # added via class swap. Use object.__setattr__ to bypass nn.Module.
+    import types
+    object.__setattr__(model, "eagle3_forward", types.MethodType(_LlamaEagle3.eagle3_forward, model))
+    object.__setattr__(model, "make_eagle3_cache", types.MethodType(_LlamaEagle3.make_eagle3_cache, model))
+
     logger.info("EAGLE3 (Llama): model patched successfully")
