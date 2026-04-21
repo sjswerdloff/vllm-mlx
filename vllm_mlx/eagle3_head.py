@@ -147,8 +147,14 @@ class Eagle3Head(nn.Module):
             "eagle_aux_hidden_state_layer_ids", [2, 29, 56]
         )
 
+        # norm_before_residual flag (RedHat speculators format)
+        self.norm_before_residual = config.get("norm_before_residual", False)
+
+        # Embedding layer (head's own, separate from target)
+        target_vocab = config.get("vocab_size", 262144)
+        self.embed_tokens = nn.Embedding(target_vocab, hidden_size)
+
         # FC: concat of aux hidden states → hidden_size
-        # Input size = len(aux_layer_ids) * hidden_size
         fc_input_size = len(self.aux_layer_ids) * hidden_size
         self.fc = nn.Linear(fc_input_size, hidden_size, bias=False)
 
@@ -188,6 +194,7 @@ class Eagle3Head(nn.Module):
         param_map = {
             # Common
             "fc.weight": "fc.weight",
+            "embed_tokens.weight": "embed_tokens.weight",
             "norm.weight": "norm.weight",
             "lm_head.weight": "lm_head.weight",
             # ThoughtWorks format (midlayer.*)
@@ -234,58 +241,75 @@ class Eagle3Head(nn.Module):
     def __call__(
         self,
         aux_hidden_states: list[mx.array],
-        token_embedding: mx.array,
+        token_ids: mx.array,
         cache: tuple | None = None,
     ) -> tuple[mx.array, tuple]:
         """Forward pass of EAGLE3 head.
 
+        Follows RedHat/speculators Eagle3DecoderLayer architecture:
+        1. Concatenate aux hidden states → fc → fused_hidden
+        2. Embed token_ids using head's OWN embed_tokens
+        3. Decoder layer: norm embeds + norm/residual hidden → attention → MLP
+        4. Final norm → lm_head → d2t mapping
+
         Args:
             aux_hidden_states: List of hidden states from target layers.
                 Each shape: (batch, seq_len, hidden_size)
-            token_embedding: Embedding of the last accepted token(s).
-                Shape: (batch, seq_len, hidden_size)
+            token_ids: Token IDs to embed (using head's own embeddings).
+                Shape: (batch, seq_len)
             cache: Optional KV cache tuple from previous step.
 
         Returns:
             Tuple of (draft_logits_in_target_vocab, new_cache)
-            draft_logits shape: (batch, seq_len, target_vocab_size)
         """
-        # Concatenate auxiliary hidden states
+        # Concatenate auxiliary hidden states → FC projection
         concat_hidden = mx.concatenate(aux_hidden_states, axis=-1)
-        # (batch, seq_len, 3 * hidden_size)
-
-        # FC projection
-        h = self.fc(concat_hidden)
+        fused_hidden = self.fc(concat_hidden)
         # (batch, seq_len, hidden_size)
 
-        # Midlayer: attention input is concat(h, token_embedding)
-        h_normed = self.midlayer_input_layernorm(h)
-        attn_input = mx.concatenate([h_normed, token_embedding], axis=-1)
+        # Embed tokens using head's OWN embeddings
+        if self.embed_tokens is not None:
+            embeds = self.embed_tokens(token_ids)
+        else:
+            # Fallback: caller must pass embeddings as token_ids
+            embeds = token_ids
+
+        # Decoder layer (matches RedHat Eagle3DecoderLayer)
+        # Split: embeds and fused_hidden
+        if self.norm_before_residual:
+            hidden = self.midlayer_hidden_norm(fused_hidden)
+            residual = hidden
+        else:
+            residual = fused_hidden
+            hidden = self.midlayer_hidden_norm(fused_hidden)
+
+        embeds_normed = self.midlayer_input_layernorm(embeds)
+        attn_input = mx.concatenate([embeds_normed, hidden], axis=-1)
         # (batch, seq_len, 2 * hidden_size)
 
         attn_out, new_cache = self.midlayer_attn(attn_input, cache=cache)
-        h = h + self.midlayer_hidden_norm(attn_out)
+        h = residual + attn_out
 
         # MLP
-        h_normed = self.midlayer_post_attention_layernorm(h)
-        h = h + self.midlayer_mlp(h_normed)
+        residual = h
+        h = self.midlayer_post_attention_layernorm(h)
+        h = residual + self.midlayer_mlp(h)
 
-        # Output projection
+        # Output
         h = self.norm(h)
         draft_logits = self.lm_head(h)
-        # (batch, seq_len, draft_vocab_size=32000)
+        # (batch, seq_len, draft_vocab_size)
 
-        # Map to target vocab space using d2t
+        # Map to target vocab using d2t (additive offset, matching RedHat)
         if self.d2t is not None:
-            # Scatter draft logits into full target vocab tensor
-            # -inf for tokens not in draft vocab
+            B, L, _ = draft_logits.shape
             target_logits = mx.full(
-                (*draft_logits.shape[:-1], self.vocab_size),
-                float("-inf"),
-                dtype=draft_logits.dtype,
+                (B, L, self.vocab_size), float("-inf"), dtype=draft_logits.dtype
             )
-            # Use d2t as indices: target_logits[..., d2t[i]] = draft_logits[..., i]
-            target_logits[..., self.d2t] = draft_logits
+            # d2t contains OFFSETS: target_idx = draft_idx + d2t[draft_idx]
+            draft_indices = mx.arange(self.d2t.shape[0])
+            target_indices = draft_indices + self.d2t
+            target_logits[:, :, target_indices] = draft_logits
         else:
             target_logits = draft_logits
 
@@ -331,6 +355,7 @@ def load_eagle3_head(model_path: str) -> Eagle3Head:
                 "intermediate_size": tlc.get("intermediate_size", 28672),
                 "draft_vocab_size": raw_config.get("draft_vocab_size", 32000),
                 "vocab_size": tlc.get("vocab_size", 128256),
+                "norm_before_residual": raw_config.get("norm_before_residual", False),
                 "eagle_config": raw_config.get("eagle_config", {}),
             }
         else:

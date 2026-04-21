@@ -177,15 +177,13 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
                     "Run model(tokens, cache=cache) first."
                 )
 
-            # Get token embeddings from model's embedding layer
-            token_embeds = self._eagle3_inner.embed_tokens(token_ids)
-
             # Extract last-position hidden states
             aux_states = [
                 h[:, -1:, :] for h in self._eagle3_aux_hidden_states
             ]
 
-            return self.eagle3(aux_states, token_embeds[:, -1:, :], cache=eagle3_cache)
+            # Pass token_ids — head uses its OWN embed_tokens
+            return self.eagle3(aux_states, token_ids[:, -1:], cache=eagle3_cache)
 
         def make_eagle3_cache(self):
             """Create empty KV cache for EAGLE3 draft head."""
