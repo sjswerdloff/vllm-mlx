@@ -278,7 +278,8 @@ class SimpleEngine(BaseEngine):
         if self._eagle3_head_path:
             try:
                 # Detect model type and use appropriate patch
-                lang_model = getattr(self._model, "language_model", self._model)
+                # For MLLM: model.language_model. For LLM: model.model (inside MLXLanguageModel wrapper)
+                lang_model = getattr(self._model, "language_model", None) or getattr(self._model, "model", self._model)
                 model_type = getattr(
                     getattr(lang_model, "config", getattr(lang_model, "args", None)),
                     "model_type", ""
@@ -1216,7 +1217,8 @@ class SimpleEngine(BaseEngine):
         )
 
         # Get the language model (which has been patched with EAGLE3)
-        lang_model = getattr(self._model, "language_model", self._model)
+        # MLLM: self._model.language_model, LLM: self._model.model (MLXLanguageModel wraps it)
+        lang_model = getattr(self._model, "language_model", None) or getattr(self._model, "model", self._model)
         tokenizer = getattr(self._model, "tokenizer", None) or self._model.get_tokenizer()
         n_draft = self._speculative_num_draft
         p_min = self._speculative_p_min
