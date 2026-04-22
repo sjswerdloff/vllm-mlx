@@ -99,12 +99,11 @@ def test_eagle3_orchestration():
     n_draft = 5
     n_rounds = 8
     prev_state_sums = advance_state_sums
-    eagle3_cache = None  # Maintained across rounds — not reset
 
     for round_num in range(n_rounds):
         last_token = generated[-1]
 
-        drafts, eagle3_cache = eagle3_draft_n_tokens(model, last_token, n_draft, sampler, eagle3_cache)
+        drafts, _ = eagle3_draft_n_tokens(model, last_token, n_draft, sampler, None)
         target_pred = mx.argmax(target_logits).item()
 
         accepted, target_logits = eagle3_verify_and_accept(

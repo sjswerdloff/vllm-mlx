@@ -34,11 +34,9 @@ logger = logging.getLogger(__name__)
 def _default_aux_layer_ids(num_layers: int) -> list[int]:
     """Compute default EAGLE3 auxiliary layer IDs for a Llama model.
 
-    Must match SpecForge training: [1, num_layers//2 - 1, num_layers - 4].
-    Our capture runs AFTER the layer, so we capture the OUTPUT of these layers.
-    SGLang uses [2, 40, 77] because they capture BEFORE the layer (output of i-1).
+    Matches vLLM's default: (2, num_layers // 2, num_layers - 3).
     """
-    return [1, num_layers // 2 - 1, num_layers - 4]
+    return [2, num_layers // 2, num_layers - 3]
 
 
 def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None = None):
@@ -152,16 +150,6 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
             self._eagle3_aux_hidden_states = [
                 captured_hidden[lid] for lid in self._eagle3_aux_layer_ids
             ]
-
-            # Diagnostic: hidden state shapes and stats
-            for idx, (lid, hs) in enumerate(zip(self._eagle3_aux_layer_ids, self._eagle3_aux_hidden_states)):
-                mx.eval(hs)
-                logger.debug(
-                    "[eagle3_capture] layer %d: shape=%s mean=%.4f std=%.4f min=%.4f max=%.4f",
-                    lid, hs.shape,
-                    hs.mean().item(), mx.sqrt(mx.var(hs)).item(),
-                    hs.min().item(), hs.max().item(),
-                )
 
             if return_hidden:
                 return out, self._eagle3_aux_hidden_states
