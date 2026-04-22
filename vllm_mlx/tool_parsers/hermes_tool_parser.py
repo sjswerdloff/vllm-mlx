@@ -95,6 +95,11 @@ class HermesToolParser(ToolParser):
         """
         Extract tool calls from a complete Hermes model response.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        if "<tool_call>" in model_output or '"name"' in model_output:
+            logger.info(f"[hermes_parser] input (last 500 chars): ...{model_output[-500:]}")
+
         tool_calls = []
         cleaned_text = model_output
 
@@ -234,6 +239,7 @@ class HermesToolParser(ToolParser):
                 cleaned_text = f"(Reasoning: {reasoning_text})"
 
         if tool_calls:
+            logger.info(f"[hermes_parser] extracted {len(tool_calls)} tool calls: {tool_calls}")
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
