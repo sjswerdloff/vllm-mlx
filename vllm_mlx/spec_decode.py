@@ -231,13 +231,109 @@ def sync_draft_cache(
 # =============================================================================
 
 
+def eagle3_prefill_cache(
+    target_model, prompt_token_ids: list[int]
+) -> tuple[tuple | None, mx.array | None]:
+    """Populate the EAGLE3 head's KV cache using full-sequence hidden states.
+
+    After the target model prefills the prompt (which captures full-sequence
+    auxiliary hidden states at the configured layers), this function runs those
+    hidden states through the EAGLE3 head in one forward pass. The resulting
+    KV cache gives the draft head full context for informed predictions,
+    instead of starting from an almost-empty cache.
+
+    The token_ids passed to the head are the prompt tokens shifted by one
+    position: the head predicts next-token, so input is [token_0, ..., token_{n-1}]
+    to predict [token_1, ..., token_n].
+
+    Must be called AFTER prefill_model() but BEFORE the first-token advance
+    (which overwrites _eagle3_aux_hidden_states with length-1 states).
+
+    Note: With chunked prefill (long prompts), the captured aux hidden states
+    only cover the last chunk. The prefill will still populate the EAGLE3
+    cache with that partial context, which is better than an empty cache.
+
+    Args:
+        target_model: Patched model with eagle3_prefill() method
+        prompt_token_ids: The original prompt token IDs (before any generation).
+            These will be shifted to create the input for the EAGLE3 head.
+
+    Returns:
+        Tuple of (populated_eagle3_cache, last_pre_norm_hidden).
+        Both can be passed directly to eagle3_draft_n_tokens.
+    """
+    if not hasattr(target_model, "eagle3_prefill"):
+        logger.warning(
+            "eagle3_prefill_cache: model has no eagle3_prefill method, "
+            "falling back to empty cache"
+        )
+        return None, None
+
+    aux_states = getattr(target_model, "_eagle3_aux_hidden_states", None)
+    if aux_states is None:
+        logger.warning(
+            "eagle3_prefill_cache: no aux hidden states captured, "
+            "falling back to empty cache"
+        )
+        return None, None
+
+    # Check sequence length of aux hidden states — prefill captures full
+    # sequence, but the first-token advance overwrites with length-1 states.
+    # We need the full-sequence states (captured during prefill).
+    seq_len = aux_states[0].shape[1]
+    if seq_len <= 1:
+        logger.debug(
+            "eagle3_prefill_cache: aux hidden states have seq_len=%d, "
+            "skipping prefill (states were already overwritten by advance)",
+            seq_len,
+        )
+        return None, None
+
+    # Build shifted token_ids: [token_0, token_1, ..., token_{n-2}, token_{n-1}]
+    # The EAGLE3 head at position i predicts token_{i+1}, so we feed
+    # the prompt tokens up to the second-to-last as input. But we need
+    # the input length to match the aux hidden states length.
+    # The aux states have length = prompt_len (from prefill).
+    # We use prompt_token_ids[0:seq_len] as input (the head's fc layer
+    # processes the aux hidden states, and the token embeddings provide
+    # the positional grounding).
+    if len(prompt_token_ids) < seq_len:
+        # Shouldn't happen in normal flow, but guard against it
+        token_input = prompt_token_ids
+    else:
+        token_input = prompt_token_ids[:seq_len]
+
+    token_arr = mx.array([token_input])  # (1, seq_len)
+
+    eagle3_cache, last_hidden = target_model.eagle3_prefill(token_arr)
+    mx.eval(eagle3_cache[0], eagle3_cache[1], last_hidden)
+
+    logger.info(
+        "eagle3_prefill_cache: populated EAGLE3 KV cache with %d positions",
+        seq_len,
+    )
+
+    return eagle3_cache, last_hidden
+
+
 def eagle3_draft_n_tokens(
-    target_model, last_token: int, n: int, sampler, eagle3_cache=None
+    target_model,
+    last_token: int,
+    n: int,
+    sampler,
+    eagle3_cache=None,
+    prev_hidden: mx.array | None = None,
 ) -> tuple[list[int], tuple | None]:
     """Generate N draft tokens using the EAGLE3 head.
 
     The target model must have been patched with inject_eagle3() and must
     have just completed a forward pass (which populates _eagle3_aux_hidden_states).
+
+    The EAGLE3 head is recurrent: on the first draft step, it fuses the
+    target model's auxiliary hidden states via fc(). On subsequent steps,
+    it feeds back its own pre-norm hidden state, providing the evolving
+    context that differentiates successive predictions (matching vLLM's
+    Eagle3LlamaForCausalLM behavior).
 
     Args:
         target_model: Patched Gemma4 model with eagle3_forward() method
@@ -245,16 +341,23 @@ def eagle3_draft_n_tokens(
         n: Number of tokens to draft
         sampler: Sampling function (logprobs -> token)
         eagle3_cache: KV cache for EAGLE3 attention layer (or None for first call)
+        prev_hidden: Pre-norm hidden state from EAGLE3 prefill or previous round.
+            When provided (e.g. from eagle3_prefill_cache), the first draft step
+            uses this instead of computing from target aux hidden states via fc().
 
     Returns:
         Tuple of (draft_token_ids, updated_eagle3_cache)
     """
     draft_tokens = []
     token_id = last_token
+    # prev_hidden: if provided from prefill, first step uses it directly;
+    # otherwise None means first step uses target aux hidden states via fc()
 
     for _ in range(n):
-        logits, eagle3_cache = target_model.eagle3_forward(
-            mx.array([[token_id]]), eagle3_cache=eagle3_cache
+        logits, eagle3_cache, prev_hidden = target_model.eagle3_forward(
+            mx.array([[token_id]]),
+            eagle3_cache=eagle3_cache,
+            prev_hidden=prev_hidden,
         )
         logits = logits[:, -1, :]  # (1, vocab)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -356,8 +459,16 @@ def eagle3_verify_and_accept(
         next_logits = lm_out.logits if hasattr(lm_out, "logits") else lm_out
     else:
         next_logits = bonus_output.logits if hasattr(bonus_output, "logits") else bonus_output
-    next_logits = next_logits[:, -1, :]
+    # Flatten to (V,) to match prefill_model convention — the bonus is always
+    # a single token so logits shape is (1, 1, V) or (1, V).
+    next_logits = next_logits.reshape(-1) if next_logits.ndim > 1 else next_logits
     mx.eval(next_logits)
+
+    # Force-evaluate the captured hidden states so the next eagle3_draft_n_tokens
+    # round reads materialized arrays rather than growing the lazy computation graph.
+    aux_states = getattr(target_model, "_eagle3_aux_hidden_states", None)
+    if aux_states is not None:
+        mx.eval(*aux_states)
 
     accepted_tokens = draft_tokens[:n_accepted] + [bonus_token_id]
 

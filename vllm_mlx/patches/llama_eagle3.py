@@ -155,21 +155,80 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
                 return out, self._eagle3_aux_hidden_states
             return out
 
+        def eagle3_prefill(
+            self,
+            token_ids: mx.array,
+        ):
+            """Run EAGLE3 head on full-sequence hidden states to populate its KV cache.
+
+            Must be called AFTER a target model forward pass that captured
+            full-sequence auxiliary hidden states (i.e. after prefill).
+
+            Passes the FULL sequence of hidden states through the EAGLE3 head
+            in one forward pass, building up the head's KV cache with context
+            from the entire prompt. This populated cache is then used as the
+            starting point for the autoregressive draft loop, giving the
+            draft head full context instead of an almost-empty cache.
+
+            The token_ids should be shifted by one position relative to the
+            hidden states: the head predicts next token, so input tokens are
+            [token_0, ..., token_{n-1}] to predict [token_1, ..., token_n].
+
+            Args:
+                token_ids: Token IDs for the sequence. Shape: (batch, seq_len).
+                    Should be the prompt tokens shifted by one position.
+
+            Returns:
+                Tuple of (populated_eagle3_cache, last_pre_norm_hidden)
+                where last_pre_norm_hidden is the hidden state at the last
+                position, to be passed as prev_hidden on the first draft step.
+            """
+            if self._eagle3_aux_hidden_states is None:
+                raise RuntimeError(
+                    "eagle3_prefill called before a forward pass. "
+                    "Run model(tokens, cache=cache) first."
+                )
+
+            # Use full-sequence hidden states (NOT sliced to last position)
+            aux_states = list(self._eagle3_aux_hidden_states)
+
+            # Run the head on the full sequence — this populates its KV cache
+            _logits, eagle3_cache, pre_norm_hidden = self.eagle3(
+                aux_states,
+                token_ids,
+                cache=None,  # Start with empty cache; the full sequence populates it
+                prev_hidden=None,  # First call uses aux hidden states via fc()
+            )
+
+            # Return only the last position's hidden state for the first draft step
+            last_hidden = pre_norm_hidden[:, -1:, :]
+
+            return eagle3_cache, last_hidden
+
         def eagle3_forward(
             self,
             token_ids: mx.array,
             eagle3_cache=None,
+            prev_hidden: mx.array | None = None,
         ):
             """Run EAGLE3 draft head using captured hidden states.
 
             Must be called AFTER a regular forward pass.
 
+            The EAGLE3 head is recurrent: on the first draft step, it uses
+            the target model's captured auxiliary hidden states. On subsequent
+            steps, it uses its own pre-norm output (prev_hidden) as the
+            hidden state input, providing evolving context that differentiates
+            successive draft predictions.
+
             Args:
                 token_ids: Token IDs to embed. Shape: (batch, seq_len)
                 eagle3_cache: KV cache for EAGLE3 attention layer.
+                prev_hidden: Pre-norm hidden state from previous draft step.
+                    None on first step (uses target aux hidden states).
 
             Returns:
-                Tuple of (logits_in_target_vocab, new_eagle3_cache)
+                Tuple of (logits_in_target_vocab, new_eagle3_cache, pre_norm_hidden)
             """
             if self._eagle3_aux_hidden_states is None:
                 raise RuntimeError(
@@ -183,7 +242,13 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
             ]
 
             # Pass token_ids — head uses its OWN embed_tokens
-            return self.eagle3(aux_states, token_ids[:, -1:], cache=eagle3_cache)
+            # prev_hidden feeds back the head's own state for recurrence
+            return self.eagle3(
+                aux_states,
+                token_ids[:, -1:],
+                cache=eagle3_cache,
+                prev_hidden=prev_hidden,
+            )
 
         def make_eagle3_cache(self):
             """Create empty KV cache for EAGLE3 draft head."""
@@ -194,6 +259,7 @@ def inject_eagle3_llama(model, eagle3_path: str, aux_layer_ids: list[int] | None
     # Bind methods explicitly — nn.Module.__getattr__ can't find methods
     # added via class swap. Use object.__setattr__ to bypass nn.Module.
     import types
+    object.__setattr__(model, "eagle3_prefill", types.MethodType(_LlamaEagle3.eagle3_prefill, model))
     object.__setattr__(model, "eagle3_forward", types.MethodType(_LlamaEagle3.eagle3_forward, model))
     object.__setattr__(model, "make_eagle3_cache", types.MethodType(_LlamaEagle3.make_eagle3_cache, model))
 

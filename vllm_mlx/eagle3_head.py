@@ -268,28 +268,43 @@ class Eagle3Head(nn.Module):
         aux_hidden_states: list[mx.array],
         token_ids: mx.array,
         cache: tuple | None = None,
-    ) -> tuple[mx.array, tuple]:
+        prev_hidden: mx.array | None = None,
+    ) -> tuple[mx.array, tuple, mx.array]:
         """Forward pass of EAGLE3 head.
 
-        Follows RedHat/speculators Eagle3DecoderLayer architecture:
-        1. Concatenate aux hidden states → fc → fused_hidden
+        Follows vLLM's Eagle3LlamaForCausalLM architecture:
+        1. First step: concatenate aux hidden states -> fc -> fused_hidden
+           Subsequent steps: use prev_hidden (head's own pre-norm output)
         2. Embed token_ids using head's OWN embed_tokens
-        3. Decoder layer: norm embeds + norm/residual hidden → attention → MLP
-        4. Final norm → lm_head → d2t mapping
+        3. Decoder layer: norm embeds + norm/residual hidden -> attention -> MLP
+        4. Final norm -> lm_head -> d2t mapping
+
+        The EAGLE3 head is a recurrent system: its own pre-norm hidden state
+        feeds back as input for the next draft step, providing the evolving
+        context that differentiates successive draft predictions.
 
         Args:
             aux_hidden_states: List of hidden states from target layers.
-                Each shape: (batch, seq_len, hidden_size)
+                Each shape: (batch, seq_len, hidden_size).
+                Used only on the first draft step (when prev_hidden is None).
             token_ids: Token IDs to embed (using head's own embeddings).
                 Shape: (batch, seq_len)
             cache: Optional KV cache tuple from previous step.
+            prev_hidden: Pre-norm hidden state from previous draft step.
+                Shape: (batch, seq_len, hidden_size).
+                When provided, replaces fc(concat(aux_hidden_states)).
 
         Returns:
-            Tuple of (draft_logits_in_target_vocab, new_cache)
+            Tuple of (draft_logits_in_target_vocab, new_cache, pre_norm_hidden)
+            where pre_norm_hidden should be passed as prev_hidden on the next step.
         """
-        # Concatenate auxiliary hidden states → FC projection
-        concat_hidden = mx.concatenate(aux_hidden_states, axis=-1)
-        fused_hidden = self.fc(concat_hidden)
+        # Get fused hidden: from target aux states (first step) or
+        # from head's own previous output (subsequent steps)
+        if prev_hidden is not None:
+            fused_hidden = prev_hidden
+        else:
+            concat_hidden = mx.concatenate(aux_hidden_states, axis=-1)
+            fused_hidden = self.fc(concat_hidden)
         # (batch, seq_len, hidden_size)
 
         # Embed tokens using head's OWN embeddings
@@ -320,6 +335,9 @@ class Eagle3Head(nn.Module):
         h = self.midlayer_post_attention_layernorm(h)
         h = residual + self.midlayer_mlp(h)
 
+        # Pre-norm hidden state: feed back to next step
+        pre_norm_hidden = h
+
         # Output
         h = self.norm(h)
         draft_logits = self.lm_head(h)
@@ -338,7 +356,7 @@ class Eagle3Head(nn.Module):
         else:
             target_logits = draft_logits
 
-        return target_logits, new_cache
+        return target_logits, new_cache, pre_norm_hidden
 
 
 def load_eagle3_head(model_path: str) -> Eagle3Head:

@@ -1205,6 +1205,7 @@ class SimpleEngine(BaseEngine):
 
         from ..spec_decode import (
             eagle3_draft_n_tokens,
+            eagle3_prefill_cache,
             eagle3_verify_and_accept,
             prefill_model,
         )
@@ -1231,25 +1232,94 @@ class SimpleEngine(BaseEngine):
             lang_model, prompt_arr, target_cache, self._prefill_step_size
         )
 
+        # Force-evaluate prefill hidden states before they get overwritten
+        aux_states = getattr(lang_model, "_eagle3_aux_hidden_states", None)
+        if aux_states is not None:
+            mx.eval(*aux_states)
+
+        # Populate the EAGLE3 head's KV cache using full-sequence hidden
+        # states from the target prefill. This gives the draft head full
+        # prompt context instead of starting with an almost-empty cache.
+        eagle3_prefill_result = eagle3_prefill_cache(lang_model, tokens_list)
+        initial_eagle3_cache, initial_eagle3_hidden = eagle3_prefill_result
+
+        # Sample the first token from prefill logits and advance the target
+        # cache so that hidden states and KV cache are aligned for the first
+        # EAGLE3 draft round.  Without this, the draft head would use the
+        # last *prompt* token (not the first *generated* token) and the
+        # first round would always produce 0 accepted drafts.
+        first_logprobs = target_logits - mx.logsumexp(target_logits, keepdims=True)
+        first_token_arr = sampler(first_logprobs[None, :])
+        mx.eval(first_token_arr)
+        first_token_id = first_token_arr.item()
+
+        # Advance target cache with first token (also captures fresh hidden
+        # states for the EAGLE3 head via the patched __call__).
+        first_out = lang_model(
+            mx.array([[first_token_id]]), cache=target_cache, return_hidden=True
+        )
+        if isinstance(first_out, tuple):
+            lm_out, _ = first_out
+            target_logits = lm_out.logits if hasattr(lm_out, "logits") else lm_out
+        else:
+            target_logits = first_out.logits if hasattr(first_out, "logits") else first_out
+        target_logits = target_logits.reshape(-1) if target_logits.ndim > 1 else target_logits
+        mx.eval(target_logits)
+
+        # Force-evaluate the hidden states so the first draft round has
+        # materialized arrays instead of a lazy computation graph.
+        aux_states = getattr(lang_model, "_eagle3_aux_hidden_states", None)
+        if aux_states is not None:
+            mx.eval(*aux_states)
+
         # Get stop token IDs
         stop_ids = set()
         if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
             stop_ids.add(tokenizer.eos_token_id)
 
-        # Generation loop
-        generated_ids = []
+        # Generation loop — first token already generated above
+        generated_ids = [first_token_id]
         prev_decoded = tokenizer.decode(tokens_list)
         total_accepted = 0
         total_proposed = 0
-        eagle3_cache = None
+        # Start with prefilled EAGLE3 cache (full prompt context) instead
+        # of None. This is the primary fix for low acceptance rates.
+        eagle3_cache = initial_eagle3_cache
+        eagle3_prev_hidden = initial_eagle3_hidden
+
+        # Yield the first token immediately for streaming responsiveness
+        full_decoded = tokenizer.decode(tokens_list + generated_ids)
+        new_text = full_decoded[len(prev_decoded):]
+        prev_decoded = full_decoded
+
+        finish_reason_first = None
+        finished_first = first_token_id in stop_ids or len(generated_ids) >= max_tokens
+        if finished_first:
+            if first_token_id in stop_ids:
+                finish_reason_first = "stop"
+            else:
+                finish_reason_first = "length"
+
+        yield GenerationOutput(
+            text=full_decoded[len(tokenizer.decode(tokens_list)):],
+            new_text=new_text,
+            prompt_tokens=n_prompt_tokens,
+            completion_tokens=1,
+            finished=finished_first,
+            finish_reason=finish_reason_first,
+        )
+
+        if finished_first:
+            return
 
         while len(generated_ids) < max_tokens:
-            last_token = generated_ids[-1] if generated_ids else tokens_list[-1]
+            last_token = generated_ids[-1]
 
             # Draft N tokens using EAGLE3 head
             n_this_round = min(n_draft, max_tokens - len(generated_ids))
             drafts, eagle3_cache = eagle3_draft_n_tokens(
-                lang_model, last_token, n_this_round, sampler, eagle3_cache
+                lang_model, last_token, n_this_round, sampler, eagle3_cache,
+                prev_hidden=eagle3_prev_hidden,
             )
 
             # Verify (also captures new hidden states for next round)
@@ -1262,8 +1332,9 @@ class SimpleEngine(BaseEngine):
                 p_min,
             )
 
-            # Reset EAGLE3 cache after verify (hidden states changed)
+            # Reset EAGLE3 cache and hidden after verify (hidden states changed)
             eagle3_cache = None
+            eagle3_prev_hidden = None
 
             # Stats
             total_proposed += len(drafts)

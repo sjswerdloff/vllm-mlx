@@ -181,19 +181,27 @@ def inject_eagle3(model, eagle3_path: str):
             self,
             token_ids: mx.array,
             eagle3_cache: tuple | None = None,
-        ) -> tuple[mx.array, tuple]:
+            prev_hidden: mx.array | None = None,
+        ) -> tuple[mx.array, tuple, mx.array]:
             """Run EAGLE3 draft head using captured hidden states.
 
             Must be called AFTER a regular forward pass (which populates
             _eagle3_aux_hidden_states).
 
+            The EAGLE3 head is recurrent: on the first draft step, it uses
+            the target model's captured auxiliary hidden states. On subsequent
+            steps, it uses its own pre-norm output (prev_hidden) as the
+            hidden state input.
+
             Args:
                 token_ids: Token IDs to embed for the draft head input.
                     Shape: (batch, seq_len)
                 eagle3_cache: KV cache for the EAGLE3 attention layer.
+                prev_hidden: Pre-norm hidden state from previous draft step.
+                    None on first step (uses target aux hidden states).
 
             Returns:
-                Tuple of (logits_in_target_vocab, new_eagle3_cache)
+                Tuple of (logits_in_target_vocab, new_eagle3_cache, pre_norm_hidden)
             """
             if self._eagle3_aux_hidden_states is None:
                 raise RuntimeError(
@@ -210,7 +218,12 @@ def inject_eagle3(model, eagle3_path: str):
                 h[:, -1:, :] for h in self._eagle3_aux_hidden_states
             ]
 
-            return self.eagle3(aux_states, token_embeds[:, -1:, :], cache=eagle3_cache)
+            return self.eagle3(
+                aux_states,
+                token_embeds[:, -1:, :],
+                cache=eagle3_cache,
+                prev_hidden=prev_hidden,
+            )
 
         def make_eagle3_cache(self):
             """Create an empty KV cache for the EAGLE3 draft head.
