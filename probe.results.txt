@@ -1,0 +1,124 @@
+======================================================================
+  MERGER ALIGNMENT PROBE (bf16 original weights)
+======================================================================
+  Image: /Users/stuartswerdloff/ai/ClaudeInstanceHomeOffices/qwopus-3527b/webcam_snapshot.jpg
+  Base:   /Users/stuartswerdloff/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd
+  Qwopus: /Users/stuartswerdloff/.cache/huggingface/hub/models--Jackrong--Qwopus3.5-27B-v3/snapshots/3acb6548c2baa1b2c426b414d1c3e134d0d56665
+
+--- Text Embeddings (embed_tokens.weight) ---
+
+Base Qwen3.5-27B:
+  Found model.language_model.embed_tokens.weight: shape=(248320, 5120) in model.safetensors-00001-of-00011.safetensors
+  Metric                         Value
+  -----------------------------------
+  mean                       -0.000001
+  std                         0.012451
+  abs_mean                    0.009782
+  norm_mean                   0.878096
+  norm_std                    0.150774
+  min                        -0.585938
+  max                         0.496094
+
+Qwopus:
+  Found model.language_model.embed_tokens.weight: shape=(248320, 5120) in model-00002-of-00012.safetensors
+  Metric                         Value
+  -----------------------------------
+  mean                       -0.000001
+  std                         0.012451
+  abs_mean                    0.009782
+  norm_mean                   0.878096
+  norm_std                    0.150774
+  min                        -0.585938
+  max                         0.496094
+
+  Embedding weight difference:
+    Max abs diff:  0.00000000
+    Mean abs diff: 0.00000000
+    Fraction changed (>1e-6): 0.0000
+
+--- Vision Encoder + Merger + Layer 0 ---
+
+Base Qwen3.5-27B:
+  Loading model from b7ca741b86de18df552fd2cc952861e04621a4bd...
+The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████| 1184/1184 [00:00<00:00, 27942.99it/s]
+  Found vision module at model.model.visual
+  Vision output shape: torch.Size([1900, 1152])
+  WARNING: Output is 1152-dim (pre-merger). Expected 5120 (post-merger).
+  Image token positions: 475, vision tokens: 1900
+  WARNING: token count mismatch, skipping injection
+  Layer 0 output shape: torch.Size([1, 491, 5120])
+
+Qwopus:
+  Loading model from 3acb6548c2baa1b2c426b414d1c3e134d0d56665...
+The tokenizer you are loading from '/Users/stuartswerdloff/.cache/huggingface/hub/models--Jackrong--Qwopus3.5-27B-v3/snapshots/3acb6548c2baa1b2c426b414d1c3e134d0d56665' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+Loading weights: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████| 1184/1184 [00:00<00:00, 28387.03it/s]
+  Found vision module at model.model.visual
+  Vision output shape: torch.Size([1900, 1152])
+  WARNING: Output is 1152-dim (pre-merger). Expected 5120 (post-merger).
+  Layer 0 output shape: torch.Size([1, 10, 5120])
+
+  Merger output difference (same weights, same image):
+    Max abs diff:  0.00000000
+    Mean abs diff: 0.00000000
+
+  Merger output cosine similarity (per vision token):
+    Mean:  1.000000
+    Min:   1.000000
+
+======================================================================
+  LAYER 0 ACTIVATIONS (vision tokens)
+======================================================================
+  Shape mismatch: base=(1, 20, 5120) vs qwopus=(1, 10, 5120)
+
+======================================================================
+  TOKENIZER SPECIAL TOKENS
+======================================================================
+  bos_token_id              base=      None  qwopus=      None  OK
+  eos_token_id              base=    248046  qwopus=    248046  OK
+  image_token_id            base=    248056  qwopus=    248056  OK
+  video_token_id            base=    248057  qwopus=    248057  OK
+  vision_end_token_id       base=    248054  qwopus=    248054  OK
+  vision_start_token_id     base=    248053  qwopus=    248053  OK
+  vocab_size                base=    248077  qwopus=    248077  OK
+
+======================================================================
+  Text Embeddings
+======================================================================
+  Metric                  Base Qwen3.5          Qwopus      Ratio
+  ------------------------------------------------------------
+  mean                       -0.000001       -0.000001     1.0000
+  std                         0.012451        0.012451     1.0000
+  abs_mean                    0.009782        0.009782     1.0000
+  norm_mean                   0.878096        0.878096     1.0000
+  norm_std                    0.150774        0.150774     1.0000
+  min                        -0.585938       -0.585938     1.0000
+  max                         0.496094        0.496094     1.0000
+
+======================================================================
+  Merger Output
+======================================================================
+  Metric                  Base Qwen3.5          Qwopus      Ratio
+  ------------------------------------------------------------
+  mean                        1.452351        1.452351     1.0000
+  std                        70.780212       70.780212     1.0000
+  abs_mean                    8.554231        8.554231     1.0000
+  norm_mean                1799.443604     1799.443604     1.0000
+  norm_std                 1592.409058     1592.409058     1.0000
+  min                      -720.000000     -720.000000     1.0000
+  max                      7008.000000     7008.000000     1.0000
+
+======================================================================
+  ALIGNMENT: Merger Output vs Text Embeddings
+======================================================================
+  Metric                         Base ratio         Qwopus ratio
+  ------------------------------------------------------------
+  norm_mean                 v/t = 2049.2567      v/t = 2049.2567
+  std                       v/t = 5684.5184      v/t = 5684.5184
+  abs_mean                   v/t = 874.5203       v/t = 874.5203
+
+======================================================================
+  VERDICT
+======================================================================
+  Merger outputs identical:   YES
+  Special tokens match:       YES

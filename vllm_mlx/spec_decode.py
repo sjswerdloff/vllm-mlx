@@ -143,18 +143,24 @@ def verify_and_accept(
         else:
             check_logits = verify_logits[0, i - 1, :]
 
+        target_greedy = mx.argmax(check_logits).item()
+        draft_token = draft_tokens[i]
+        target_prob_of_draft = mx.softmax(check_logits.reshape(-1))[draft_token].item()
+
+        logger.info(
+            "[eagle3_verify] pos %d: draft=%d target_greedy=%d match=%s p(draft)=%.4f",
+            i, draft_token, target_greedy, draft_token == target_greedy, target_prob_of_draft,
+        )
+
         if p_min == 0.0:
             # Greedy verification: argmax must match
-            if mx.argmax(check_logits).item() == draft_tokens[i]:
+            if target_greedy == draft_token:
                 n_accepted += 1
             else:
                 break
         else:
             # Probability threshold verification
-            logits_1d = check_logits.reshape(-1)
-            probs = mx.softmax(logits_1d)
-            mx.eval(probs)
-            if probs[draft_tokens[i]].item() >= p_min:
+            if target_prob_of_draft >= p_min:
                 n_accepted += 1
             else:
                 break
@@ -353,13 +359,29 @@ def eagle3_draft_n_tokens(
     # prev_hidden: if provided from prefill, first step uses it directly;
     # otherwise None means first step uses target aux hidden states via fc()
 
-    for _ in range(n):
+    for step_i in range(n):
         logits, eagle3_cache, prev_hidden = target_model.eagle3_forward(
             mx.array([[token_id]]),
             eagle3_cache=eagle3_cache,
             prev_hidden=prev_hidden,
         )
         logits = logits[:, -1, :]  # (1, vocab)
+
+        # Diagnostic: top-5 predictions from the head
+        top5_idx = mx.argpartition(logits[0], kth=-5)[-5:]
+        top5_vals = logits[0][top5_idx]
+        mx.eval(top5_idx, top5_vals)
+        sorted_order = mx.argsort(-top5_vals)
+        top5_idx = top5_idx[sorted_order]
+        top5_probs = mx.softmax(logits[0])[top5_idx]
+        mx.eval(top5_probs)
+        logger.info(
+            "[eagle3_draft] step %d: input_token=%d, top5=%s probs=%s",
+            step_i, token_id,
+            [int(x) for x in top5_idx.tolist()],
+            [f"{p:.3f}" for p in top5_probs.tolist()],
+        )
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         y = sampler(logprobs)
         mx.eval(y)
@@ -416,16 +438,22 @@ def eagle3_verify_and_accept(
         else:
             check_logits = verify_logits[0, i - 1, :]
 
+        target_greedy = mx.argmax(check_logits).item()
+        draft_token = draft_tokens[i]
+        target_prob = mx.softmax(check_logits.reshape(-1))[draft_token].item()
+
+        logger.info(
+            "[eagle3_verify] pos %d: draft=%d target_greedy=%d match=%s p(draft)=%.4f",
+            i, draft_token, target_greedy, draft_token == target_greedy, target_prob,
+        )
+
         if p_min == 0.0:
-            if mx.argmax(check_logits).item() == draft_tokens[i]:
+            if target_greedy == draft_token:
                 n_accepted += 1
             else:
                 break
         else:
-            logits_1d = check_logits.reshape(-1)
-            probs = mx.softmax(logits_1d)
-            mx.eval(probs)
-            if probs[draft_tokens[i]].item() >= p_min:
+            if target_prob >= p_min:
                 n_accepted += 1
             else:
                 break
