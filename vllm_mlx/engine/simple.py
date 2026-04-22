@@ -1332,9 +1332,12 @@ class SimpleEngine(BaseEngine):
                 p_min,
             )
 
-            # Reset EAGLE3 cache and hidden after verify (hidden states changed)
-            eagle3_cache = None
-            eagle3_prev_hidden = None
+            # Rebuild EAGLE3 cache from current hidden states.
+            # The verify step ran the target model, updating aux hidden states.
+            # Rebuild the EAGLE3 cache so the head has fresh context.
+            eagle3_cache, eagle3_prev_hidden = eagle3_prefill_cache(
+                lang_model, tokens_list + generated_ids
+            )
 
             # Stats
             total_proposed += len(drafts)
