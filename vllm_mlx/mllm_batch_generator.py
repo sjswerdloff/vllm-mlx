@@ -826,6 +826,8 @@ class MLLMBatchGenerator:
             except Exception:
                 pass  # Fall back to language model's internal computation
 
+        logger.info(f"[chunked_prefill] total={total} step={step} will_chunk={total > step}")
+
         # Short prompt — process in one shot (no chunking overhead)
         if total <= step:
             self._prefill_progress[request.request_id] = (total, total)
@@ -858,7 +860,18 @@ class MLLMBatchGenerator:
                     :, :, processed : processed + step
                 ]
             self.language_model(chunk, cache=cache, **kwargs)
-            mx.eval([c.state for c in cache])
+            # Eval ALL cache types to break the lazy graph between chunks.
+            # ArraysCache (GatedDeltaNet) has .state list; KVCache (full
+            # attention) has .keys/.values arrays. Must eval both or the
+            # graph accumulates across chunks → OOM on long prompts.
+            cache_tensors = []
+            for c in cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cache_tensors.extend([c.keys, c.values])
+                elif hasattr(c, "cache"):
+                    # ArraysCache stores state in .cache list
+                    cache_tensors.extend([x for x in c.cache if x is not None])
+            mx.eval(cache_tensors)
             processed += step
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
@@ -908,17 +921,69 @@ class MLLMBatchGenerator:
         if request.image_grid_thw is not None:
             kwargs["image_grid_thw"] = request.image_grid_thw
 
-        # Run full VLM forward pass with cache.
-        # The VLM passes cache= through to self.language_model(),
-        # so the language model writes KV state directly into our cache.
         input_ids = request.input_ids
         if input_ids.ndim == 1:
             input_ids = input_ids[None, :]
 
-        output = self.model(input_ids, cache=cache, **kwargs)
-        request.vision_encoded = True
+        total = input_ids.shape[1]
+        step = self.prefill_step_size
 
-        # Handle LanguageModelOutput or plain tensor
+        # For short prompts, run the full VLM forward in one shot (original path)
+        if total <= step:
+            output = self.model(input_ids, cache=cache, **kwargs)
+            request.vision_encoded = True
+            if hasattr(output, "logits"):
+                return output.logits
+            return output
+
+        # Long prompt with vision: separate ViT encoding from LLM forward.
+        # 1) Run get_input_embeddings to encode images + merge into embeddings
+        # 2) Chunk the LLM forward on the merged embeddings
+        logger.info(
+            f"[vision_chunked] {total} tokens — encoding vision then chunking LLM"
+        )
+
+        embed_output = self.model.get_input_embeddings(
+            input_ids=input_ids, **kwargs
+        )
+        inputs_embeds = embed_output.inputs_embeds
+        mx.eval(inputs_embeds)
+
+        # Chunked LLM forward on merged embeddings
+        processed = 0
+        chunk_count = 0
+        while processed + step < total:
+            chunk_embeds = inputs_embeds[:, processed : processed + step, :]
+            self.language_model(
+                input_ids[:, processed : processed + step],
+                inputs_embeds=chunk_embeds,
+                cache=cache,
+            )
+            # Eval all cache types to break the lazy graph
+            cache_tensors = []
+            for c in cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cache_tensors.extend([c.keys, c.values])
+                elif hasattr(c, "cache"):
+                    cache_tensors.extend([x for x in c.cache if x is not None])
+            mx.eval(cache_tensors)
+            processed += step
+            chunk_count += 1
+            self._prefill_progress[request.request_id] = (processed, total)
+
+            if chunk_count % 4 == 0:
+                mx.clear_cache()
+
+        # Last chunk — return logits
+        last_embeds = inputs_embeds[:, processed:, :]
+        output = self.language_model(
+            input_ids[:, processed:],
+            inputs_embeds=last_embeds,
+            cache=cache,
+        )
+        request.vision_encoded = True
+        self._prefill_progress[request.request_id] = (total, total)
+
         if hasattr(output, "logits"):
             return output.logits
         return output
@@ -1077,7 +1142,13 @@ class MLLMBatchGenerator:
 
                                 chunk = remaining[:, processed : processed + step]
                                 self.language_model(chunk, cache=request_cache)
-                                mx.eval([c.state for c in request_cache])
+                                cache_tensors = []
+                                for c in request_cache:
+                                    if hasattr(c, "keys") and c.keys is not None:
+                                        cache_tensors.extend([c.keys, c.values])
+                                    elif hasattr(c, "cache"):
+                                        cache_tensors.extend([x for x in c.cache if x is not None])
+                                mx.eval(cache_tensors)
                                 processed += step
                                 chunk_count += 1
                                 self._prefill_progress[req.request_id] = (
@@ -1157,7 +1228,10 @@ class MLLMBatchGenerator:
                     with mx.stream(MLLMBatchGenerator._stream):
                         # Text-only: chunked prefill with real progress tracking
                         # Multimodal: atomic VLM forward (vision encoder needs full input)
-                        if req.is_text_only:
+                        has_pixels = req.pixel_values is not None and req.pixel_values.size > 0
+                        use_chunked = req.is_text_only or (not has_pixels and req.input_ids is not None and req.input_ids.size > self.prefill_step_size)
+                        logger.info(f"[prefill] req={req.request_id[:8]} is_text_only={req.is_text_only} has_pixels={has_pixels} tokens={req.input_ids.size if req.input_ids is not None else 0} chunked={use_chunked}")
+                        if use_chunked:
                             logits = self._run_chunked_text_prefill(
                                 req, cache=request_cache
                             )
@@ -1604,6 +1678,7 @@ class MLLMBatchGenerator:
         """
         if self.prefix_cache is None or not end_indices:
             return
+        logger.info(f"[prefix_cache] Storing caches for {len(end_indices)} finished requests")
         for i in end_indices:
             req = batch.requests[i]
             if req.input_ids is not None:
@@ -1620,6 +1695,7 @@ class MLLMBatchGenerator:
                     prompt_cache = _trim_cache_offset(extracted, total_trim)
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
                     self.prefix_cache.store(cache_key, prompt_cache)
+                    logger.info(f"[prefix_cache] Stored {len(cache_key)} tokens for {req.request_id[:8]}")
                 except Exception as e:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
