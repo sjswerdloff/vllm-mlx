@@ -765,6 +765,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         generator._aborted_request_ids = set()
         generator._prefill_progress = {}
         generator.prefix_cache = None
+        generator.session_cache = None
+        generator._think_suffix_len = 0
+        generator._vision_feature_cache = None
         generator.prefill_step_size = 512
         generator.language_model = object()
         generator.model = MagicMock()

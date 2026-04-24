@@ -19,6 +19,7 @@ Architecture:
 import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -64,6 +65,119 @@ class PrefillAbortedError(Exception):
     def __init__(self, request_id: str):
         self.request_id = request_id
         super().__init__(f"Prefill aborted for request {request_id}")
+
+
+class SessionKVCache:
+    """Persistent KV cache across conversation turns, like llama.cpp slots.
+
+    Instead of hashing token sequences, this does direct token comparison
+    to find the longest common prefix between the stored KV cache and the
+    new request.  This handles vision/text-only token mismatches that break
+    hash-based prefix caching — the prefix match stops at the first
+    divergence, and only the remaining tokens need processing.
+
+    Designed for the Apple Silicon use case: a small number of concurrent
+    conversations, each with long context.  Stores up to ``max_sessions``
+    KV caches in RAM, evicting LRU when full.
+    """
+
+    def __init__(self, max_sessions: int = 4):
+        self.max_sessions = max_sessions
+        # OrderedDict for LRU: {session_key: (token_ids, kv_cache)}
+        self._sessions: "OrderedDict[str, tuple[list[int], list[Any]]]" = OrderedDict()
+        self._stats = {"hits": 0, "misses": 0, "stores": 0}
+
+    def fetch(
+        self, token_ids: list[int], min_prefix: int = 64
+    ) -> tuple[list[Any] | None, list[int] | None, str | None]:
+        """Find the best matching session for the given token sequence.
+
+        Scans all stored sessions and returns the one with the longest
+        common prefix, provided it meets ``min_prefix`` length.
+
+        Returns:
+            (kv_cache, remaining_token_ids, session_key) on hit.
+            (None, None, None) on miss.
+        """
+        best_key = None
+        best_prefix_len = 0
+
+        for key, (stored_ids, _kv_cache) in self._sessions.items():
+            max_len = min(len(stored_ids), len(token_ids))
+            prefix_len = 0
+            for i in range(max_len):
+                if stored_ids[i] != token_ids[i]:
+                    break
+                prefix_len = i + 1
+
+            if prefix_len > best_prefix_len:
+                best_prefix_len = prefix_len
+                best_key = key
+
+        if best_key is None or best_prefix_len < min_prefix:
+            self._stats["misses"] += 1
+            return None, None, None
+
+        self._sessions.move_to_end(best_key)
+        stored_ids, kv_cache = self._sessions[best_key]
+        remaining = token_ids[best_prefix_len:]
+
+        # If the stored cache is longer than the prefix match, we need to
+        # trim it.  The KV cache offset must equal the prefix length.
+        stored_len = len(stored_ids)
+        if stored_len > best_prefix_len:
+            trim_amount = stored_len - best_prefix_len
+            kv_cache = _trim_cache_offset(kv_cache, trim_amount)
+
+        self._stats["hits"] += 1
+        logger.info(
+            f"[session_cache] Hit: prefix={best_prefix_len} "
+            f"remaining={len(remaining)} session={best_key[:12]}"
+        )
+        return kv_cache, remaining, best_key
+
+    def store(
+        self, token_ids: list[int], kv_cache: list[Any], session_key: str | None = None
+    ) -> str:
+        """Store KV cache for a conversation session.
+
+        If ``session_key`` is provided (from a previous fetch hit), updates
+        the existing session.  Otherwise creates a new session keyed by a
+        hash of the first 256 tokens (stable across conversation turns).
+
+        Returns the session key.
+        """
+        if session_key is None:
+            # Derive key from system prompt / early tokens
+            prefix_tokens = token_ids[:256]
+            session_key = str(hash(tuple(prefix_tokens)))
+
+        # Evict LRU if at capacity
+        while (
+            len(self._sessions) >= self.max_sessions
+            and session_key not in self._sessions
+        ):
+            evicted_key, _ = self._sessions.popitem(last=False)
+            logger.info(f"[session_cache] Evicted session {evicted_key[:12]}")
+
+        self._sessions[session_key] = (list(token_ids), kv_cache)
+        self._sessions.move_to_end(session_key)
+        self._stats["stores"] += 1
+        logger.info(
+            f"[session_cache] Stored {len(token_ids)} tokens, "
+            f"session={session_key[:12]}, active={len(self._sessions)}"
+        )
+        return session_key
+
+    def get_stats(self) -> dict:
+        return {
+            **self._stats,
+            "active_sessions": len(self._sessions),
+            "max_sessions": self.max_sessions,
+        }
+
+    def clear(self) -> None:
+        self._sessions.clear()
 
 
 @dataclass
@@ -487,6 +601,15 @@ class MLLMBatchGenerator:
                 config=prefix_cache_config,
             )
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
+
+        # Session-based KV cache: persistent across conversation turns.
+        # Unlike the prefix cache (hash-based, breaks on vision/text-only
+        # token mismatch), this uses direct token comparison to find the
+        # longest common prefix.  Like llama.cpp slots but simpler —
+        # designed for the Apple Silicon use case with few concurrent
+        # conversations and long context.
+        self.session_cache = SessionKVCache(max_sessions=4)
+        logger.info("MLLMBatchGenerator: Session KV cache enabled (max_sessions=4)")
 
         # Normalize chat template for prefix-cache stability.
         # Qwen3.5 chat template retroactively changes formatting of earlier
@@ -1347,15 +1470,33 @@ class MLLMBatchGenerator:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
 
-                # Try prefix cache for all requests (text-only and multimodal).
-                # VLM forward writes the same KV state as language model forward
-                # for text tokens, so cached KV from a previous VLM run is valid.
-                # However, if the remaining (uncached) tokens contain image
-                # placeholders, we must fall back to VLM forward instead of
-                # running them through the language model alone.
+                # Try session cache first (direct token comparison, handles
+                # vision/text-only mismatch), then fall back to prefix cache
+                # (hash-based, faster for exact matches).
                 cached_kv = None
                 remaining_ids = None
-                if self.prefix_cache is not None and req.input_ids is not None:
+                session_key = None
+
+                if self.session_cache is not None and req.input_ids is not None:
+                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    S = self._think_suffix_len
+                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    sess_kv, sess_remaining, session_key = self.session_cache.fetch(
+                        lookup_ids
+                    )
+                    if sess_kv is not None:
+                        cached_kv = sess_kv
+                        remaining_ids = sess_remaining
+                        # Append think suffix back
+                        if S > 0:
+                            remaining_ids = list(remaining_ids) + input_ids_list[-S:]
+
+                # Fall back to prefix cache if session cache missed
+                if (
+                    cached_kv is None
+                    and self.prefix_cache is not None
+                    and req.input_ids is not None
+                ):
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Strip think suffix from lookup key so stored entries
                     # (also stripped) match as clean PREFIX.
@@ -1558,6 +1699,17 @@ class MLLMBatchGenerator:
                         all_logprobs.append(logprobs.squeeze(0))
 
                     per_request_caches.append(request_cache)
+
+                # Store in session cache after prefill (not after generation).
+                # This is the key difference from the prefix cache — even if
+                # generation times out, the next request benefits.
+                if self.session_cache is not None and req.input_ids is not None:
+                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    S = self._think_suffix_len
+                    store_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    # Copy cache before storing — generation will mutate it
+                    stored_cache = self._copy_prefix_cache(request_cache)
+                    self.session_cache.store(store_ids, stored_cache, session_key)
 
             except PrefillAbortedError:
                 aborted_requests.append(req)
@@ -2005,19 +2157,24 @@ class MLLMBatchGenerator:
 
     def get_prefix_cache_stats(self) -> Dict[str, Any]:
         """Get KV prefix cache statistics."""
+        stats = {}
         if self.prefix_cache is not None:
-            return self.prefix_cache.get_stats()
-        return {
-            "hits": 0,
-            "misses": 0,
-            "hit_rate": 0.0,
-            "evictions": 0,
-            "tokens_saved": 0,
-            "current_memory_mb": 0.0,
-            "max_memory_mb": 0.0,
-            "memory_utilization": 0.0,
-            "entry_count": 0,
-        }
+            stats = self.prefix_cache.get_stats()
+        else:
+            stats = {
+                "hits": 0,
+                "misses": 0,
+                "hit_rate": 0.0,
+                "evictions": 0,
+                "tokens_saved": 0,
+                "current_memory_mb": 0.0,
+                "max_memory_mb": 0.0,
+                "memory_utilization": 0.0,
+                "entry_count": 0,
+            }
+        if self.session_cache is not None:
+            stats["session_cache"] = self.session_cache.get_stats()
+        return stats
 
     def has_pending(self) -> bool:
         """Check if there are pending or active requests."""
