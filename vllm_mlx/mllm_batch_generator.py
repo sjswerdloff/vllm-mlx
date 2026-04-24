@@ -32,10 +32,15 @@ from .vision_embedding_cache import VisionEmbeddingCache, compute_images_hash
 
 logger = logging.getLogger(__name__)
 
-# How often to log progress and save session cache checkpoints during
-# chunked prefill, measured in chunks.  Each chunk is prefill_step_size
-# tokens (default 2048).  Set to 1 for per-chunk logging (~10s intervals).
-PREFILL_PROGRESS_INTERVAL = 1
+# How often to log progress during chunked prefill, measured in chunks.
+# Each chunk is prefill_step_size tokens (default 2048).
+# Set to 1 for per-chunk logging (~10s intervals).
+PREFILL_LOG_INTERVAL = 1
+
+# How often to save session cache checkpoints during chunked prefill.
+# Each save copies the KV cache, so higher values reduce memory churn.
+# Set to 4 for checkpoints every ~40 seconds.
+PREFILL_SAVE_INTERVAL = 4
 
 
 def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
@@ -173,7 +178,7 @@ class SessionKVCache:
             and session_key not in self._sessions
         ):
             evicted_key, _ = self._sessions.popitem(last=False)
-            logger.info(f"[session_cache] Evicted session {evicted_key[:12]}")
+            logger.info(f"[session_cache] Evicted session {evicted_key}")
 
         self._sessions[session_key] = (list(token_ids), kv_cache)
         self._sessions.move_to_end(session_key)
@@ -251,7 +256,7 @@ class SessionKVCache:
                 saved += 1
                 logger.info(
                     f"[session_persist] saved session {i}: "
-                    f"{len(token_ids)} tokens, key={key[:12]}"
+                    f"{len(token_ids)} tokens, key={key}"
                 )
             except Exception as e:
                 logger.warning(f"[session_persist] failed to save session {i}: {e}")
@@ -1166,10 +1171,14 @@ class MLLMBatchGenerator:
         """Create shallow copies of cache objects to prevent mutation of stored prefix cache.
 
         MLX arrays are immutable and safe to share, but cache objects have mutable
-        Python attributes (offset, _idx) that get modified by update_and_fetch().
-        Without copying, the stored prefix cache entry is corrupted after each use.
+        Python attributes (offset, _idx, cache list) that get modified by
+        update_and_fetch() or __setitem__().  Without copying, the stored prefix
+        cache entry is corrupted after each use.
+
+        Handles KVCache, RotatingKVCache, ArraysCache (GatedDeltaNet/hybrid
+        models), and CacheList (composite caches).
         """
-        from mlx_lm.models.cache import KVCache, RotatingKVCache
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 
         copies = []
         for c in cache_list:
@@ -1188,8 +1197,32 @@ class MLLMBatchGenerator:
                 new_c.values = c.values
                 new_c.offset = c.offset
                 copies.append(new_c)
+            elif isinstance(c, ArraysCache):
+                # ArraysCache stores RNN state in a mutable .cache list.
+                # The list entries are mx.arrays (immutable), but the list
+                # itself gets mutated via __setitem__ during forward pass.
+                new_c = ArraysCache(len(c.cache))
+                new_c.cache = list(c.cache)  # shallow copy of the list
+                if hasattr(c, "left_padding"):
+                    new_c.left_padding = c.left_padding
+                copies.append(new_c)
+            elif isinstance(c, CacheList):
+                # CacheList wraps multiple sub-caches — recurse
+                copied_subs = MLLMBatchGenerator._copy_prefix_cache(list(c.caches))
+                new_c = CacheList(*copied_subs)
+                copies.append(new_c)
             else:
-                copies.append(c)
+                # Unknown cache type — copy what we can via duck typing
+                import copy
+
+                try:
+                    copies.append(copy.copy(c))
+                except Exception:
+                    logger.warning(
+                        f"[_copy_prefix_cache] Cannot copy {type(c).__name__}, "
+                        f"using original (risk of mutation)"
+                    )
+                    copies.append(c)
         return copies
 
     @staticmethod
@@ -1352,13 +1385,13 @@ class MLLMBatchGenerator:
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
 
-            # Progress logging and incremental session cache save every 8 chunks
-            if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
+            if chunk_count % PREFILL_LOG_INTERVAL == 0:
                 pct = processed * 100 // total
                 logger.info(
                     f"[chunked_prefill] {request.request_id[:8]} "
                     f"progress: {processed}/{total} tokens ({pct}%)"
                 )
+            if chunk_count % PREFILL_SAVE_INTERVAL == 0:
                 if self.session_cache is not None and cache:
                     partial_cache = self._copy_prefix_cache(cache)
                     self.session_cache.store(
@@ -1518,13 +1551,13 @@ class MLLMBatchGenerator:
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
 
-            # Progress logging and incremental session cache save every 8 chunks
-            if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
+            if chunk_count % PREFILL_LOG_INTERVAL == 0:
                 pct = processed * 100 // total
                 logger.info(
                     f"[vision_chunked] {request.request_id[:8]} "
                     f"progress: {processed}/{total} tokens ({pct}%)"
                 )
+            if chunk_count % PREFILL_SAVE_INTERVAL == 0:
                 if self.session_cache is not None and cache:
                     partial_cache = self._copy_prefix_cache(cache)
                     self.session_cache.store(
@@ -1839,8 +1872,7 @@ class MLLMBatchGenerator:
                                     total_tokens,
                                 )
 
-                                # Progress logging every 8 chunks
-                                if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
+                                if chunk_count % PREFILL_LOG_INTERVAL == 0:
                                     done = cached_count + processed
                                     pct = done * 100 // total_tokens
                                     logger.info(

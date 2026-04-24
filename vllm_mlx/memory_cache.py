@@ -275,10 +275,26 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     import mlx.core as mx
     from mlx_lm.models.cache import RotatingKVCache
 
+    from mlx_lm.models.cache import ArraysCache, CacheList
+
     trimmed: list[Any] = []
     eval_targets: list[Any] = []
     for layer_cache in cache:
-        if isinstance(layer_cache, _QuantizedCacheWrapper):
+        if isinstance(layer_cache, ArraysCache):
+            # ArraysCache stores RNN state (not position-indexed KV).
+            # Cannot trim positions — copy the list to prevent mutation.
+            new_c = ArraysCache(len(layer_cache.cache))
+            new_c.cache = list(layer_cache.cache)
+            if hasattr(layer_cache, "left_padding"):
+                new_c.left_padding = layer_cache.left_padding
+            trimmed.append(new_c)
+            continue
+        elif isinstance(layer_cache, CacheList):
+            # Recurse into sub-caches
+            copied_subs = _trim_cache_offset(list(layer_cache.caches), trim_by)
+            trimmed.append(CacheList(*copied_subs))
+            continue
+        elif isinstance(layer_cache, _QuantizedCacheWrapper):
             # Shallow copy with reduced offset
             tc = _QuantizedCacheWrapper.__new__(_QuantizedCacheWrapper)
             tc.keys = layer_cache.keys
