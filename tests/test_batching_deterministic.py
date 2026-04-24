@@ -246,6 +246,10 @@ class TestBatchingPerformance:
                 tokens = await asyncio.gather(*[get_output(r) for r in request_ids])
                 return sum(tokens)
 
+        # Warm-up: run once each to compile kernels and avoid first-run overhead
+        await run_sequential()
+        await run_batched()
+
         # Time sequential
         start = time.perf_counter()
         seq_tokens = await run_sequential()
@@ -256,7 +260,7 @@ class TestBatchingPerformance:
         batch_tokens = await run_batched()
         batch_time = time.perf_counter() - start
 
-        # Batched should be faster (at least 1.5x)
+        # Batched should have better throughput (allow 10% tolerance for variance)
         seq_throughput = seq_tokens / seq_time
         batch_throughput = batch_tokens / batch_time
 
@@ -264,7 +268,6 @@ class TestBatchingPerformance:
         print(f"Batched: {batch_throughput:.1f} tok/s")
         print(f"Speedup: {batch_throughput/seq_throughput:.2f}x")
 
-        # Batched should have better throughput (allow 10% tolerance for variance)
         assert batch_throughput > seq_throughput * 0.9, (
             f"Batched ({batch_throughput:.1f} tok/s) should be faster than "
             f"sequential ({seq_throughput:.1f} tok/s)"
@@ -453,6 +456,53 @@ class TestEdgeCases:
                     if out.finished:
                         assert out.completion_tokens > 0
                         break
+
+
+class TestBatchGeneratorCleanup:
+    """Test that BatchGenerator is closed promptly on engine stop."""
+
+    @pytest.mark.anyio
+    async def test_batch_generator_closed_after_engine_stop(self, model_and_tokenizer):
+        """BatchGenerator must be closed before engine stop returns.
+
+        If the generator is left alive for GC to collect on a worker thread,
+        its __del__ → close() → mx.synchronize() can SIGABRT because the
+        worker thread has no running asyncio event loop.
+        """
+        from vllm_mlx import AsyncEngineCore, SamplingParams
+
+        model, tokenizer = model_and_tokenizer
+        params = SamplingParams(max_tokens=5, temperature=0.0)
+
+        engine = AsyncEngineCore(model, tokenizer)
+        await engine.__aenter__()
+        await asyncio.sleep(0.05)
+
+        # Generate something so the scheduler creates a BatchGenerator
+        rid = await engine.add_request("Hello", params)
+        async for out in engine.stream_outputs(rid, timeout=30):
+            if out.finished:
+                break
+
+        # The batch generator should exist after generation
+        bg = engine.engine.scheduler.batch_generator
+        assert bg is not None, "BatchGenerator should exist after generation"
+
+        # Stop the engine
+        await engine.__aexit__(None, None, None)
+
+        # After stop, the batch generator must have been closed (set to None)
+        assert engine.engine.scheduler.batch_generator is None, (
+            "BatchGenerator must be None after engine stop to prevent "
+            "GC-thread __del__ SIGABRT"
+        )
+
+        # The old generator's _old_wired_limit should also be None
+        # (meaning close() was called, making __del__ a no-op)
+        assert getattr(bg, "_old_wired_limit", None) is None, (
+            "BatchGenerator._old_wired_limit must be None after close() "
+            "so __del__ is safe from any thread"
+        )
 
 
 if __name__ == "__main__":

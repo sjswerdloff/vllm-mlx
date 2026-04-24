@@ -2,6 +2,8 @@
 
 vllm-mlx provides a FastAPI server with full OpenAI API compatibility.
 
+By default the server binds only to `127.0.0.1`. Use `--host 0.0.0.0` only when you intentionally want to expose it beyond the local machine.
+
 ## Starting the Server
 
 ### Simple Mode (Default)
@@ -33,15 +35,17 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--port` | Server port | 8000 |
-| `--host` | Server host | 0.0.0.0 |
+| `--host` | Server host | 127.0.0.1 |
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--use-paged-cache` | Enable paged KV cache | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
 | `--max-tokens` | Default max tokens | 32768 |
+| `--max-request-tokens` | Maximum `max_tokens` accepted from API clients | 32768 |
 | `--default-temperature` | Default temperature when not specified | None |
 | `--default-top-p` | Default top_p when not specified | None |
 | `--stream-interval` | Tokens per stream chunk | 1 |
@@ -127,6 +131,23 @@ GET /health
 ```
 
 Returns server status.
+
+### Metrics
+
+```bash
+GET /metrics
+```
+
+Prometheus scrape endpoint for server, cache, scheduler, and request metrics.
+The endpoint is disabled by default and is enabled with `--enable-metrics`.
+
+```bash
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --enable-metrics
+```
+
+`/metrics` is intentionally unauthenticated. Expose it only on a trusted
+network or behind a reverse proxy / firewall that limits who can scrape it.
 
 ### Anthropic Messages API
 

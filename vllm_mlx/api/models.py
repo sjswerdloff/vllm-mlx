@@ -11,8 +11,9 @@ These models define the request and response schemas for:
 
 import time
 import uuid
+from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -162,7 +163,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
@@ -173,6 +174,8 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
     # Structured output
     response_format: ResponseFormat | dict | None = None
+    # Extra kwargs forwarded to tokenizer.apply_chat_template
+    chat_template_kwargs: dict[str, Any] | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
@@ -193,16 +196,15 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChoice(BaseModel):
@@ -248,7 +250,7 @@ class CompletionRequest(BaseModel):
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, gt=0)
     stream: bool = False
     stop: list[str] | None = None
     # Sampling penalties
@@ -433,6 +435,43 @@ class EmbeddingResponse(BaseModel):
 
 
 # =============================================================================
+# Reranking
+# =============================================================================
+
+
+class RerankRequest(BaseModel):
+    """Request for reranking documents against a query (Jina/Cohere convention)."""
+
+    model: str
+    query: str
+    documents: list[str | dict]
+    top_n: int | None = None
+    return_documents: bool = True
+
+
+class RerankResult(BaseModel):
+    """A single reranked document result."""
+
+    index: int
+    relevance_score: float
+    document: dict | None = None
+
+
+class RerankUsage(BaseModel):
+    """Token usage for rerank requests."""
+
+    total_tokens: int = 0
+
+
+class RerankResponse(BaseModel):
+    """Response for reranking endpoint (Jina/Cohere convention)."""
+
+    model: str
+    results: list[RerankResult]
+    usage: RerankUsage = Field(default_factory=RerankUsage)
+
+
+# =============================================================================
 # Streaming (for SSE responses)
 # =============================================================================
 
@@ -442,16 +481,15 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[dict] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChunkChoice(BaseModel):

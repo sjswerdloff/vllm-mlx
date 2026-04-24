@@ -19,7 +19,6 @@ Architecture:
 """
 
 import asyncio
-import concurrent.futures
 import logging
 import time
 import uuid
@@ -36,6 +35,7 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
+from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -346,7 +346,9 @@ class MLLMScheduler:
             temperature: Sampling temperature
             top_p: Top-p sampling
             request_id: Optional custom request ID
-            **kwargs: Additional generation parameters
+            **kwargs: Additional generation parameters.  ``logits_processors``
+                — list of callables ``(tokens, logits) -> logits`` applied
+                during sampling (e.g. constrained JSON decoding).
 
         Returns:
             Request ID for tracking
@@ -362,6 +364,7 @@ class MLLMScheduler:
             min_p=kwargs.pop("min_p", 0.0),
             presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
+            logits_processors=kwargs.pop("logits_processors", None),
         )
 
         request = MLLMRequest(
@@ -422,11 +425,29 @@ class MLLMScheduler:
             except ValueError:
                 pass
 
-        # Remove from batch generator
+        # Remove from batch generator.
+        #
+        # IMPORTANT: `abort_request` may be called from the asyncio event
+        # loop (e.g. in `stream_outputs`' `finally` block on client
+        # disconnect) while `scheduler.step()` — and therefore the
+        # batch generator's forward pass — is running on a separate
+        # executor thread (see engine_core.py: loop.run_in_executor).
+        #
+        # Calling `batch_generator.remove([uid])` eagerly here would
+        # trigger `active_batch.filter(...)`, which creates an
+        # `mx.array` and submits Metal work.  If the scheduler thread
+        # has an open Metal encoder mid-forward-pass, two threads
+        # submit to the same stream concurrently and Metal asserts
+        # with ``encodeSignalEvent:value: with uncommitted encoder``,
+        # aborting the process.
+        #
+        # Instead we defer the removal to the scheduler thread: it
+        # will drain the queue at the next safe boundary (start of
+        # step(), before any forward pass).
         if request_id in self.request_id_to_uid:
             uid = self.request_id_to_uid[request_id]
             if self.batch_generator is not None:
-                self.batch_generator.remove([uid])
+                self.batch_generator.schedule_removal([uid])
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request_id]
 
@@ -491,12 +512,15 @@ class MLLMScheduler:
                 min_p=request.sampling_params.min_p,
                 presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
+                logits_processors=request.sampling_params.logits_processors,
             )
             batch_requests.append(batch_req)
 
             request.status = RequestStatus.RUNNING
             self.running[request.request_id] = request
             scheduled.append(request)
+
+            self.total_prompt_tokens += request.num_prompt_tokens
 
         # Insert into batch generator
         if batch_requests and self.batch_generator is not None:
@@ -666,6 +690,14 @@ class MLLMScheduler:
         """
         output = MLLMSchedulerOutput()
 
+        # Drain any deferred removals queued from other threads (e.g.
+        # the asyncio event loop during client-disconnect aborts).
+        # This MUST run before any forward pass to avoid the Metal
+        # ``encodeSignalEvent: uncommitted encoder`` race.  See
+        # `abort_request` and `MLLMBatchGenerator.schedule_removal`.
+        if self.batch_generator is not None:
+            self.batch_generator.process_pending_removals()
+
         # Schedule waiting requests
         scheduled = self._schedule_waiting()
         output.scheduled_request_ids = [r.request_id for r in scheduled]
@@ -753,37 +785,31 @@ class MLLMScheduler:
     async def _process_loop(self) -> None:
         """Main async processing loop.
 
-        Uses a thread pool executor for steps that involve prefill
-        (waiting requests or partial prefill in progress) so that the
-        event loop stays responsive for health checks and other HTTP
-        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        MLLM models are loaded on the server/event-loop thread, so their MLX
+        arrays and cache state must be consumed on that same thread.  Unlike
+        the text-only EngineCore path, moving MLLM prefill to a worker crosses
+        MLX stream ownership and can fail with "no Stream in current thread".
         """
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mllm-step"
-        )
-        loop = asyncio.get_running_loop()
+        streams_bound = False
+
+        def _ensure_streams_bound() -> None:
+            nonlocal streams_bound
+            if not streams_bound:
+                bind_generation_streams()
+                streams_bound = True
 
         while self._running:
             try:
                 if self.has_requests():
-                    has_waiting = self.get_num_waiting() > 0
-                    has_partial = (
-                        self.batch_generator is not None
-                        and getattr(self.batch_generator, "_partial", None) is not None
-                    )
-                    needs_executor = has_waiting or has_partial
-
-                    if needs_executor:
-                        await loop.run_in_executor(_executor, self.step)
-                    else:
-                        self.step()
-                        await asyncio.sleep(0)
+                    _ensure_streams_bound()
+                    self.step()
+                    await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
 
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
@@ -852,10 +878,11 @@ class MLLMScheduler:
                 if output is None:
                     finished_normally = True
                     break
-                yield output
                 if output.finished:
                     finished_normally = True
+                    yield output
                     break
+                yield output
         finally:
             if not finished_normally:
                 logger.info(f"Aborting orphaned MLLM request {request_id}")
@@ -1035,6 +1062,23 @@ class MLLMScheduler:
         stats["memory_aware_cache"] = prefix_stats
 
         return stats
+
+    def clear_runtime_caches(self) -> Dict[str, bool]:
+        """Clear runtime caches without resetting scheduler/request state."""
+        cleared = {
+            "vision_cache": False,
+            "prefix_cache": False,
+        }
+        if self.vision_cache:
+            self.vision_cache.clear()
+            cleared["vision_cache"] = True
+        if (
+            self.batch_generator is not None
+            and self.batch_generator.prefix_cache is not None
+        ):
+            self.batch_generator.prefix_cache.clear()
+            cleared["prefix_cache"] = True
+        return cleared
 
     def reset(self) -> None:
         """Reset the scheduler state."""
