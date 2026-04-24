@@ -57,7 +57,8 @@ def client(server_url):
         c = anthropic.Anthropic(base_url=server_url, api_key="dummy")
         # Quick connectivity check
         c.messages.create(
-            model="default", max_tokens=1,
+            model="default",
+            max_tokens=1,
             messages=[{"role": "user", "content": "hi"}],
         )
         return c
@@ -124,15 +125,25 @@ class TestVisionUserMessage:
         msg = client.messages.create(
             model=model,
             max_tokens=128,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": "image/jpeg", "data": image_b64,
-                    }},
-                    {"type": "text", "text": "Describe what you see in one sentence."},
-                ],
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe what you see in one sentence.",
+                        },
+                    ],
+                }
+            ],
         )
         assert msg.usage.input_tokens > 15  # should include image tokens
         assert msg.usage.output_tokens > 0
@@ -141,16 +152,23 @@ class TestVisionUserMessage:
         msg = client.messages.create(
             model=model,
             max_tokens=128,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Look at this image:"},
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": "image/jpeg", "data": image_b64,
-                    }},
-                    {"type": "text", "text": "What season is it?"},
-                ],
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Look at this image:"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": "What season is it?"},
+                    ],
+                }
+            ],
         )
         assert msg.usage.output_tokens > 0
 
@@ -165,17 +183,36 @@ class TestVisionToolResult:
             max_tokens=128,
             messages=[
                 {"role": "user", "content": "Read the image at /tmp/photo.jpg"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "call_001", "name": "Read",
-                     "input": {"file_path": "/tmp/photo.jpg"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call_001", "content": [
-                        {"type": "image", "source": {
-                            "type": "base64", "media_type": "image/jpeg", "data": image_b64,
-                        }},
-                    ]},
-                ]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_001",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/photo.jpg"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_001",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": image_b64,
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                },
             ],
         )
         assert msg.usage.output_tokens > 0
@@ -192,14 +229,27 @@ class TestVisionToolResult:
             max_tokens=64,
             messages=[
                 {"role": "user", "content": "List files in /tmp"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "call_002", "name": "Bash",
-                     "input": {"command": "ls /tmp"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call_002",
-                     "content": "file1.txt\nfile2.txt"},
-                ]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_002",
+                            "name": "Bash",
+                            "input": {"command": "ls /tmp"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_002",
+                            "content": "file1.txt\nfile2.txt",
+                        },
+                    ],
+                },
             ],
         )
         assert msg.usage.output_tokens > 0
@@ -228,17 +278,29 @@ class TestToolCalling:
             tools=SAMPLE_TOOLS,
             messages=[
                 {"role": "user", "content": "What's in /tmp/hello.txt?"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "call_003", "name": "Read",
-                     "input": {"file_path": "/tmp/hello.txt"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call_003",
-                     "content": "Hello, World!"},
-                ]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_003",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/hello.txt"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_003",
+                            "content": "Hello, World!",
+                        },
+                    ],
+                },
             ],
         )
-        text = _extract_text(msg)
         assert msg.usage.output_tokens > 0
 
 
@@ -251,22 +313,46 @@ class TestMixedContent:
             model=model,
             max_tokens=128,
             messages=[
-                {"role": "user", "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": "image/jpeg", "data": image_b64,
-                    }},
-                    {"type": "text", "text": "I'll show you more files soon."},
-                ]},
-                {"role": "assistant", "content": "I can see the image. What would you like me to do?"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": "I'll show you more files soon."},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": "I can see the image. What would you like me to do?",
+                },
                 {"role": "user", "content": "Now check what's in /tmp"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "call_004", "name": "Bash",
-                     "input": {"command": "ls /tmp"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "call_004",
-                     "content": "photo.jpg\nnotes.txt"},
-                ]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "call_004",
+                            "name": "Bash",
+                            "input": {"command": "ls /tmp"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_004",
+                            "content": "photo.jpg\nnotes.txt",
+                        },
+                    ],
+                },
             ],
         )
         assert msg.usage.output_tokens > 0
@@ -296,15 +382,22 @@ class TestStreaming:
         with client.messages.stream(
             model=model,
             max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": "image/jpeg", "data": image_b64,
-                    }},
-                    {"type": "text", "text": "Describe briefly."},
-                ],
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
+                        },
+                        {"type": "text", "text": "Describe briefly."},
+                    ],
+                }
+            ],
         ) as stream:
             for text in stream.text_stream:
                 chunks.append(text)
