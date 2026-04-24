@@ -112,6 +112,31 @@ class TestHybridCacheEvalFunctional:
                 f"If count < 6, some cache types are being skipped."
             )
 
+    def test_copy_prefix_cache_copies_arrays_cache(self):
+        """_copy_prefix_cache must copy ArraysCache to prevent mutation."""
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        kv = KVCache()
+        kv.keys = mx.ones((1, 4, 8))
+        kv.values = mx.ones((1, 4, 8))
+        kv.offset = 8
+
+        arr = ArraysCache(2)
+        arr.cache = [mx.ones((1, 4, 8)), mx.zeros((1, 4, 8))]
+
+        original = [kv, arr]
+        copied = MLLMBatchGenerator._copy_prefix_cache(original)
+
+        # Mutate the copy's ArraysCache
+        copied[1].cache[0] = mx.full((1, 4, 8), 99.0)
+
+        # Original should be untouched
+        assert mx.array_equal(
+            original[1].cache[0], mx.ones((1, 4, 8))
+        ), "Original ArraysCache mutated — _copy_prefix_cache returned a reference, not a copy"
+
 
 # =============================================================================
 # 2. Text-only MLLM requests skip processor
@@ -382,6 +407,8 @@ class TestVisionPrefillAbortCheck:
         gen._prefill_progress = {}
         gen._aborted_request_ids = set()
         gen._vision_feature_cache = None
+        gen._think_suffix_len = 0
+        gen.session_cache = None
 
         request = MLLMBatchRequest(
             uid=0,
@@ -562,6 +589,44 @@ class TestSessionKVCache:
 
         kv, _, _ = cache.fetch(short_match, min_prefix=3)
         assert kv is not None, "Should hit with lower min_prefix"
+
+    def test_vision_and_text_sessions_coexist(self):
+        """Vision and text-only requests for same conversation get separate sessions."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4)
+
+        # Same first 256 tokens (system prompt), different after
+        shared_prefix = list(range(256))
+        img_token = 151646
+
+        vision_tokens = shared_prefix + [img_token] * 100 + list(range(500, 600))
+        text_tokens = shared_prefix + list(range(300, 500))
+
+        vision_key = SessionKVCache.make_session_key(vision_tokens, has_images=True)
+        text_key = SessionKVCache.make_session_key(text_tokens, has_images=False)
+
+        assert vision_key != text_key, (
+            "Vision and text keys must differ — if they match, "
+            "one overwrites the other's session cache"
+        )
+        assert vision_key.endswith(":vision")
+        assert text_key.endswith(":text")
+
+        # Store both
+        cache.store(vision_tokens, [TrackingKVCache()], session_key=vision_key)
+        cache.store(text_tokens, [TrackingKVCache()], session_key=text_key)
+
+        assert cache.get_stats()["active_sessions"] == 2
+
+        # Both should hit independently
+        kv_v, _, key_v = cache.fetch(vision_tokens + [999], min_prefix=200)
+        assert kv_v is not None, "Vision session should hit"
+        assert key_v == vision_key
+
+        kv_t, _, key_t = cache.fetch(text_tokens + [999], min_prefix=200)
+        assert kv_t is not None, "Text session should hit"
+        assert key_t == text_key
 
 
 # =============================================================================
