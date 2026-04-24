@@ -4403,8 +4403,10 @@ async def _stream_anthropic_messages(
     # Extract messages for engine
     if engine.is_mllm:
         # MLLM: keep images inside messages (engine.stream_chat extracts them internally)
-        messages = [m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
-                    for m in openai_request.messages]
+        messages = [
+            m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
+            for m in openai_request.messages
+        ]
     else:
         messages, images, videos = extract_multimodal_content(
             openai_request.messages,
@@ -4526,11 +4528,8 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if (
-                        not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content_to_emit
-                        )
+                    if not tool_markup_possible and not _streaming_tool_markup_possible(
+                        tool_accumulated_text + content_to_emit
                     ):
                         tool_accumulated_text += content_to_emit
                     else:
@@ -4576,11 +4575,8 @@ async def _stream_anthropic_messages(
 
                 # Filter tool call markup during streaming
                 if tool_parser and content_to_emit:
-                    if (
-                        not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content_to_emit
-                        )
+                    if not tool_markup_possible and not _streaming_tool_markup_possible(
+                        tool_accumulated_text + content_to_emit
                     ):
                         tool_accumulated_text += content_to_emit
                     else:
@@ -4887,11 +4883,8 @@ async def stream_chat_completion(
 
                 # Tool call parsing on content portion
                 if tool_parser and content:
-                    if (
-                        not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + content
-                        )
+                    if not tool_markup_possible and not _streaming_tool_markup_possible(
+                        tool_accumulated_text + content
                     ):
                         tool_accumulated_text += content
                         # Suppress whitespace-only content when tools are active;
@@ -5014,11 +5007,8 @@ async def stream_chat_completion(
                     # This preserves the cheap path for ordinary text while still
                     # allowing generic streaming tool parsing when no explicit
                     # parser flags are configured.
-                    if (
-                        not tool_markup_possible
-                        and not _streaming_tool_markup_possible(
-                            tool_accumulated_text + delta_text
-                        )
+                    if not tool_markup_possible and not _streaming_tool_markup_possible(
+                        tool_accumulated_text + delta_text
                     ):
                         tool_accumulated_text += delta_text
                         # No tool markup yet, fall through to normal chunk emission

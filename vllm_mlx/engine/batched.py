@@ -968,12 +968,12 @@ class BatchedEngine(BaseEngine):
             r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
             r"\s*\{%-\s*if\b.*?%\}"  # nested IF
             r".*?"
-            r"\{%-\s*else\s*%\}"     # nested ELSE
+            r"\{%-\s*else\s*%\}"  # nested ELSE
             r".*?"
-            r"\{%-\s*endif\s*%\}"    # nested ENDIF
+            r"\{%-\s*endif\s*%\}"  # nested ENDIF
             r"\s*\{%-\s*else\s*%\}"  # OUTER ELSE
-            r"\s*(\{\{-.*?\}\})"     # plain content (capture)
-            r"\s*\{%-\s*endif\s*%\}" # OUTER ENDIF
+            r"\s*(\{\{-.*?\}\})"  # plain content (capture)
+            r"\s*\{%-\s*endif\s*%\}"  # OUTER ENDIF
         )
         new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
         if new_template != template:
