@@ -32,6 +32,11 @@ from .vision_embedding_cache import VisionEmbeddingCache, compute_images_hash
 
 logger = logging.getLogger(__name__)
 
+# How often to log progress and save session cache checkpoints during
+# chunked prefill, measured in chunks.  Each chunk is prefill_step_size
+# tokens (default 2048).  Set to 1 for per-chunk logging (~10s intervals).
+PREFILL_PROGRESS_INTERVAL = 1
+
 
 def _processors_can_retire(processors: Optional[List[Callable]]) -> bool:
     """True when any processor advertises a retire-to-content transition."""
@@ -136,6 +141,18 @@ class SessionKVCache:
         )
         return kv_cache, remaining, best_key
 
+    @staticmethod
+    def make_session_key(token_ids: list[int], has_images: bool = False) -> str:
+        """Derive a session key from early tokens and request type.
+
+        Vision and text-only requests for the same conversation produce
+        different token sequences (image placeholders vs text), so they
+        get separate session keys to avoid overwriting each other's cache.
+        """
+        prefix_tokens = token_ids[:256]
+        suffix = ":vision" if has_images else ":text"
+        return str(hash(tuple(prefix_tokens))) + suffix
+
     def store(
         self, token_ids: list[int], kv_cache: list[Any], session_key: str | None = None
     ) -> str:
@@ -148,9 +165,7 @@ class SessionKVCache:
         Returns the session key.
         """
         if session_key is None:
-            # Derive key from system prompt / early tokens
-            prefix_tokens = token_ids[:256]
-            session_key = str(hash(tuple(prefix_tokens)))
+            session_key = self.make_session_key(token_ids)
 
         # Evict LRU if at capacity
         while (
@@ -178,6 +193,139 @@ class SessionKVCache:
 
     def clear(self) -> None:
         self._sessions.clear()
+
+    def save_to_disk(self, cache_dir: str) -> bool:
+        """Save all session entries to disk using safetensors.
+
+        Directory layout::
+
+            cache_dir/
+              session_index.json
+              session_0.safetensors
+              session_0_tokens.bin
+              ...
+
+        Returns True if at least one entry was saved.
+        """
+        import array as _array
+        import json
+        import os
+        import time as _time
+
+        if not self._sessions:
+            logger.info("[session_persist] nothing to save (0 sessions)")
+            return False
+
+        try:
+            from mlx_lm.models.cache import save_prompt_cache
+        except ImportError:
+            logger.warning("[session_persist] mlx_lm not available, cannot save")
+            return False
+
+        t0 = _time.monotonic()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        index = {"version": 1, "num_sessions": len(self._sessions), "sessions": []}
+        saved = 0
+
+        for i, (key, (token_ids, kv_cache)) in enumerate(self._sessions.items()):
+            entry_path = os.path.join(cache_dir, f"session_{i}.safetensors")
+            tokens_path = os.path.join(cache_dir, f"session_{i}_tokens.bin")
+            try:
+                save_prompt_cache(
+                    entry_path,
+                    kv_cache,
+                    metadata={"num_tokens": str(len(token_ids))},
+                )
+                arr = _array.array("i", token_ids)
+                with open(tokens_path, "wb") as f:
+                    arr.tofile(f)
+
+                index["sessions"].append(
+                    {
+                        "index": i,
+                        "session_key": key,
+                        "num_tokens": len(token_ids),
+                    }
+                )
+                saved += 1
+                logger.info(
+                    f"[session_persist] saved session {i}: "
+                    f"{len(token_ids)} tokens, key={key[:12]}"
+                )
+            except Exception as e:
+                logger.warning(f"[session_persist] failed to save session {i}: {e}")
+
+        index_path = os.path.join(cache_dir, "session_index.json")
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2)
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[session_persist] SAVED {saved}/{len(self._sessions)} sessions "
+            f"to {cache_dir} in {dt:.1f}s"
+        )
+        return saved > 0
+
+    def load_from_disk(self, cache_dir: str) -> int:
+        """Load session entries from disk. Returns number loaded."""
+        import array as _array
+        import json
+        import os
+        import time as _time
+
+        index_path = os.path.join(cache_dir, "session_index.json")
+        if not os.path.exists(index_path):
+            logger.info(f"[session_persist] no index at {index_path}, nothing to load")
+            return 0
+
+        try:
+            from mlx_lm.models.cache import load_prompt_cache
+        except ImportError:
+            logger.warning("[session_persist] mlx_lm not available, cannot load")
+            return 0
+
+        t0 = _time.monotonic()
+        with open(index_path) as f:
+            index = json.load(f)
+
+        if index.get("version", 0) != 1:
+            logger.warning("[session_persist] version mismatch, discarding")
+            return 0
+
+        loaded = 0
+        for entry in index.get("sessions", []):
+            i = entry["index"]
+            entry_path = os.path.join(cache_dir, f"session_{i}.safetensors")
+            tokens_path = os.path.join(cache_dir, f"session_{i}_tokens.bin")
+
+            if not os.path.exists(entry_path) or not os.path.exists(tokens_path):
+                logger.warning(f"[session_persist] missing files for session {i}")
+                continue
+
+            try:
+                arr = _array.array("i")
+                with open(tokens_path, "rb") as f:
+                    arr.fromfile(f, entry["num_tokens"])
+                token_ids = list(arr)
+
+                kv_cache = load_prompt_cache(entry_path)
+
+                session_key = entry["session_key"]
+                self._sessions[session_key] = (token_ids, kv_cache)
+                loaded += 1
+                logger.info(
+                    f"[session_persist] loaded session {i}: "
+                    f"{len(token_ids)} tokens, key={session_key[:12]}"
+                )
+            except Exception as e:
+                logger.warning(f"[session_persist] failed to load session {i}: {e}")
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[session_persist] LOADED {loaded} sessions from {cache_dir} in {dt:.1f}s"
+        )
+        return loaded
 
 
 @dataclass
@@ -1155,8 +1303,9 @@ class MLLMBatchGenerator:
         session_ids_full = input_ids_list[:-S] if S > 0 else input_ids_list
         session_key = None
         if self.session_cache is not None:
-            prefix_tokens = session_ids_full[:256]
-            session_key = str(hash(tuple(prefix_tokens)))
+            session_key = SessionKVCache.make_session_key(
+                session_ids_full, has_images=False
+            )
 
         # Process all chunks except the last
         processed = 0
@@ -1204,7 +1353,7 @@ class MLLMBatchGenerator:
             self._prefill_progress[request.request_id] = (processed, total)
 
             # Progress logging and incremental session cache save every 8 chunks
-            if chunk_count % 8 == 0:
+            if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
                 pct = processed * 100 // total
                 logger.info(
                     f"[chunked_prefill] {request.request_id[:8]} "
@@ -1323,8 +1472,9 @@ class MLLMBatchGenerator:
         session_ids_full = input_ids_list[:-S] if S > 0 else input_ids_list
         session_key = None
         if self.session_cache is not None:
-            prefix_tokens = session_ids_full[:256]
-            session_key = str(hash(tuple(prefix_tokens)))
+            session_key = SessionKVCache.make_session_key(
+                session_ids_full, has_images=bool(request.images)
+            )
 
         # Chunked LLM forward on merged embeddings
         processed = 0
@@ -1369,7 +1519,7 @@ class MLLMBatchGenerator:
             self._prefill_progress[request.request_id] = (processed, total)
 
             # Progress logging and incremental session cache save every 8 chunks
-            if chunk_count % 8 == 0:
+            if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
                 pct = processed * 100 // total
                 logger.info(
                     f"[vision_chunked] {request.request_id[:8]} "
@@ -1648,9 +1798,24 @@ class MLLMBatchGenerator:
                                 if req.request_id in self._aborted_request_ids:
                                     self._aborted_request_ids.discard(req.request_id)
                                     logger.info(
-                                        f"[chunked_prefill] Aborted {req.request_id} "
+                                        f"[cache_resume] Aborted {req.request_id} "
                                         f"at {cached_count + processed}/{total_tokens} tokens"
                                     )
+                                    if self.session_cache is not None and request_cache:
+                                        partial = self._copy_prefix_cache(request_cache)
+                                        done = cached_count + processed
+                                        store_ids = (
+                                            input_ids_list[:-S]
+                                            if S > 0
+                                            else input_ids_list
+                                        )
+                                        self.session_cache.store(
+                                            store_ids[:done], partial, session_key
+                                        )
+                                        logger.info(
+                                            f"[session_cache] Saved partial resume: "
+                                            f"{done}/{total_tokens} tokens before abort"
+                                        )
                                     raise PrefillAbortedError(req.request_id)
 
                                 chunk = remaining[:, processed : processed + step]
@@ -1670,6 +1835,16 @@ class MLLMBatchGenerator:
                                     cached_count + processed,
                                     total_tokens,
                                 )
+
+                                # Progress logging every 8 chunks
+                                if chunk_count % PREFILL_PROGRESS_INTERVAL == 0:
+                                    done = cached_count + processed
+                                    pct = done * 100 // total_tokens
+                                    logger.info(
+                                        f"[cache_resume] {req.request_id[:8]} "
+                                        f"progress: {done}/{total_tokens} tokens ({pct}%)"
+                                    )
+
                                 if chunk_count % 4 == 0:
                                     mx.clear_cache()
                             # Last chunk — return logits
@@ -1776,6 +1951,11 @@ class MLLMBatchGenerator:
                     store_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                     # Copy cache before storing — generation will mutate it
                     stored_cache = self._copy_prefix_cache(request_cache)
+                    has_images = bool(req.images)
+                    if session_key is None:
+                        session_key = SessionKVCache.make_session_key(
+                            store_ids, has_images=has_images
+                        )
                     self.session_cache.store(store_ids, stored_cache, session_key)
 
             except PrefillAbortedError:

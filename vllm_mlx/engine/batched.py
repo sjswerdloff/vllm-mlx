@@ -1146,22 +1146,30 @@ class BatchedEngine(BaseEngine):
         return None
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
-        """Save prefix cache to disk for persistence across restarts."""
+        """Save prefix cache and session cache to disk for persistence across restarts."""
+        saved = False
         if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
-            if pc is not None:
-                return pc.save_to_disk(cache_dir)
+            bg = self._mllm_scheduler.batch_generator
+            if bg.prefix_cache is not None:
+                saved = bg.prefix_cache.save_to_disk(cache_dir) or saved
+            if bg.session_cache is not None:
+                saved = bg.session_cache.save_to_disk(cache_dir) or saved
+            return saved
         if self._engine:
             return self._engine.save_cache_to_disk(cache_dir)
         return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
-        """Load prefix cache from disk. Returns number of entries loaded."""
+        """Load prefix cache and session cache from disk. Returns number of entries loaded."""
+        loaded = 0
         if self._mllm_scheduler:
             self._mllm_scheduler._ensure_batch_generator()
-            pc = self._mllm_scheduler.batch_generator.prefix_cache
-            if pc is not None:
-                return pc.load_from_disk(cache_dir)
+            bg = self._mllm_scheduler.batch_generator
+            if bg.prefix_cache is not None:
+                loaded += bg.prefix_cache.load_from_disk(cache_dir)
+            if bg.session_cache is not None:
+                loaded += bg.session_cache.load_from_disk(cache_dir)
+            return loaded
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0
