@@ -459,7 +459,109 @@ class TestVisionPrefillAbortCheck:
 
 
 # =============================================================================
-# 6. Vision feature cache passes through to get_input_embeddings
+# 6. Session KV cache: persistent across conversation turns
+#
+# The session cache uses direct token comparison (not hashing) to find the
+# longest common prefix between stored KV state and new requests.  This
+# handles the vision/text-only token mismatch that breaks hash-based prefix
+# caching.  Like llama.cpp slots but for Apple Silicon.
+# =============================================================================
+
+
+class TestSessionKVCache:
+    """Verify session KV cache stores and matches across turns."""
+
+    def test_session_cache_stores_and_fetches(self):
+        """Store a session, fetch with same prefix → hit."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4)
+
+        token_ids = list(range(100))
+        mock_kv = [TrackingKVCache(), TrackingArraysCache()]
+
+        session_key = cache.store(token_ids, mock_kv)
+
+        # Same prefix + 10 new tokens → should hit
+        new_tokens = list(range(100)) + list(range(1000, 1010))
+        kv, remaining, key = cache.fetch(new_tokens)
+
+        assert kv is not None, "Session cache should hit on prefix match"
+        assert remaining == list(range(1000, 1010))
+        assert key == session_key
+
+    def test_session_cache_handles_vision_text_mismatch(self):
+        """Vision and text-only requests diverge at image placeholder position."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4)
+
+        img_token = 151646
+        vision_tokens = list(range(50)) + [img_token] * 100 + list(range(150, 200))
+        mock_kv = [TrackingKVCache()]
+
+        cache.store(vision_tokens, mock_kv)
+
+        # Text-only: diverges at position 50 (no image placeholders)
+        text_tokens = list(range(50)) + list(range(200, 350))
+
+        kv, remaining, key = cache.fetch(text_tokens, min_prefix=10)
+
+        assert kv is not None, "Should match shared text prefix before image tokens"
+        assert len(remaining) == len(text_tokens) - 50
+
+    def test_session_cache_lru_eviction(self):
+        """Oldest session evicted when at capacity."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=2)
+
+        cache.store([1, 2, 3], [TrackingKVCache()], session_key="s1")
+        cache.store([4, 5, 6], [TrackingKVCache()], session_key="s2")
+        cache.store([7, 8, 9], [TrackingKVCache()], session_key="s3")
+
+        assert cache.get_stats()["active_sessions"] == 2
+
+        # s1 evicted
+        kv, _, _ = cache.fetch([1, 2, 3, 10], min_prefix=2)
+        assert kv is None, "Evicted session should not hit"
+
+        # s2 still present
+        kv, _, _ = cache.fetch([4, 5, 6, 10], min_prefix=2)
+        assert kv is not None, "Non-evicted session should hit"
+
+    def test_session_cache_updates_existing_session(self):
+        """Storing with same session_key updates the session."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=2)
+
+        cache.store([1, 2, 3], [TrackingKVCache()], session_key="conv1")
+        cache.store([1, 2, 3, 4, 5], [TrackingKVCache()], session_key="conv1")
+
+        assert cache.get_stats()["active_sessions"] == 1
+        kv, remaining, _ = cache.fetch([1, 2, 3, 4, 5, 6], min_prefix=3)
+        assert kv is not None
+        assert remaining == [6]
+
+    def test_session_cache_min_prefix_filter(self):
+        """Short prefix matches filtered by min_prefix."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4)
+        cache.store(list(range(100)), [TrackingKVCache()], session_key="s1")
+
+        # Only 5 tokens match — below default min_prefix=64
+        short_match = list(range(5)) + list(range(500, 600))
+        kv, _, _ = cache.fetch(short_match)
+        assert kv is None, "Short prefix match should be filtered"
+
+        kv, _, _ = cache.fetch(short_match, min_prefix=3)
+        assert kv is not None, "Should hit with lower min_prefix"
+
+
+# =============================================================================
+# 7. Vision feature cache passes through to get_input_embeddings
 #
 # When the vision feature cache is enabled and the request has images,
 # _run_vision_encoding must pass vision_cache and _image_key as kwargs
