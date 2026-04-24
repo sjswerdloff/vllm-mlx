@@ -16,14 +16,20 @@ All clones use consistent naming:
 - `origin` — `sjswerdloff/vllm-mlx` (our fork)
 - `upstream` — `waybarrios/vllm-mlx` (upstream)
 
+## Testing Kindled Changes
+
+**Every kindled-specific change must have a test in a `test_kindled_*.py` file.** Never add kindled tests to upstream test files — upstream merges will overwrite them.
+
+- `tests/test_kindled_regressions.py` — guards for fixes we carry on top of upstream
+- Add new `tests/test_kindled_*.py` files as needed for new features
+
+This ensures `pytest tests/test_kindled_*.py -v` catches any functionality lost after merging upstream.
+
 ## After Upstream Merge
 
-Run kindled regression tests to catch overwritten fixes:
-```bash
-pytest tests/test_kindled_regressions.py -v
-```
-
-These guard: hybrid cache eval (OOM fix), text-only MLLM processor skip, Nemotron/JSON tool parsing, prefix cache for vision history.
+1. Merge `origin/main` into `kindled-main` (on a branch, via PR)
+2. Run kindled regression tests: `pytest tests/test_kindled_*.py -v`
+3. If any fail, our patches were overwritten — restore before merging
 
 ## Kindled-Specific Code
 
