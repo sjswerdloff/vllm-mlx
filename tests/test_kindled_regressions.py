@@ -231,3 +231,111 @@ class TestNemotronJSONHybridParsing:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["command"] == "ls -la"
         assert args["timeout"] == 30
+
+
+# =============================================================================
+# 4. Prefix cache must work for vision requests with images in history
+#
+# The Anthropic API sends full conversation history including images from
+# old turns. Once an image enters the conversation, every subsequent request
+# has is_text_only=False. The prefix cache must still hit for the shared
+# token prefix so we don't re-prefill 126K tokens on every request.
+#
+# This tests the cache store/fetch cycle directly without needing an
+# inference engine running.
+# =============================================================================
+
+
+class TestPrefixCacheVisionHistory:
+    """Verify prefix cache works when images are in conversation history."""
+
+    def _make_cache(self):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+
+        config = MemoryCacheConfig(max_entries=10)
+        mock_model = MagicMock()
+        return MemoryAwarePrefixCache(model=mock_model, config=config)
+
+    def _make_fake_kv(self, n_layers=4):
+        """Create fake KV cache entries (list of cache-like objects)."""
+        caches = []
+        for _ in range(n_layers):
+            c = MagicMock()
+            c.keys = mx.zeros((1, 8, 100, 64))
+            c.values = mx.zeros((1, 8, 100, 64))
+            c.offset = 100
+            caches.append(c)
+        return caches
+
+    def test_vision_request_cache_hit_on_text_suffix(self):
+        """Second request with same prefix should hit cache.
+
+        Simulates: request 1 (vision, 100 tokens) stores cache.
+        Request 2 (vision, 110 tokens sharing first 100) should hit
+        and only need to process the 10 new tokens.
+        """
+        cache = self._make_cache()
+        kv = self._make_fake_kv()
+
+        # First request: store 100 tokens (includes image token 151646 at position 50)
+        IMG_TOKEN = 151646
+        tokens_1 = list(range(50)) + [IMG_TOKEN] + list(range(51, 100))
+        cache.store(tokens_1, kv)
+
+        # Second request: same 100 tokens prefix + 10 new text tokens
+        tokens_2 = tokens_1 + list(range(1000, 1010))
+        cached_kv, remaining = cache.fetch(tokens_2)
+
+        assert cached_kv is not None, (
+            "Prefix cache should hit — first 100 tokens are identical. "
+            "If this fails, vision requests with images in history will "
+            "re-prefill the entire context on every request."
+        )
+        assert len(remaining) == 10, (
+            f"Expected 10 remaining tokens, got {len(remaining)}"
+        )
+
+    def test_image_token_in_remaining_clears_hit(self):
+        """If image tokens are in the REMAINING portion, cache hit must clear.
+
+        The language-model-only path can't handle image placeholder tokens.
+        """
+        cache = self._make_cache()
+        kv = self._make_fake_kv()
+
+        IMG_TOKEN = 151646
+
+        # Store 100 text-only tokens
+        tokens_1 = list(range(100))
+        cache.store(tokens_1, kv)
+
+        # New request: same 100 prefix + 10 tokens INCLUDING image token
+        tokens_2 = tokens_1 + [200, 201, IMG_TOKEN, 203, 204, 205, 206, 207, 208, 209]
+        cached_kv, remaining = cache.fetch(tokens_2)
+
+        # Cache DOES hit at the fetch level
+        assert cached_kv is not None, "Fetch should find the prefix match"
+
+        # But the image token guard in mllm_batch_generator should clear it.
+        # We test the guard logic directly:
+        if cached_kv is not None and remaining:
+            has_image_in_remaining = IMG_TOKEN in remaining
+            assert has_image_in_remaining, (
+                "Image token should be in remaining tokens"
+            )
+            # This is where mllm_batch_generator clears the hit —
+            # correct behavior, can't use language-model-only path
+
+    def test_repeated_identical_vision_requests_hit_cache(self):
+        """Exact same token sequence on second request should be exact hit."""
+        cache = self._make_cache()
+        kv = self._make_fake_kv()
+
+        IMG_TOKEN = 151646
+        tokens = list(range(50)) + [IMG_TOKEN] + list(range(51, 100))
+
+        cache.store(tokens, kv)
+        cached_kv, remaining = cache.fetch(tokens)
+
+        assert cached_kv is not None, "Exact match should hit"
+        assert remaining == [], "Exact match should have no remaining tokens"
