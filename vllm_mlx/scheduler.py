@@ -16,7 +16,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -25,9 +25,9 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
-from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -862,7 +862,9 @@ def _install_mtp(
             _rnn_snapshots = {}
             if not optimistic:
                 for _ci, _c in enumerate(prompt_cache):
-                    if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):  # noqa: SIM102
+                    if not (
+                        hasattr(_c, "is_trimmable") and _c.is_trimmable()
+                    ):  # noqa: SIM102
                         if hasattr(_c, "state"):
                             _rnn_snapshots[_ci] = [
                                 s.copy() if s is not None else None for s in _c.state
@@ -1705,7 +1707,9 @@ class Scheduler:
                 if hasattr(layer_cache, "values") and layer_cache.values is None:
                     return False
                 # Validate batch dimension == 1 for KVCache layers
-                if hasattr(layer_cache, "keys") and layer_cache.keys is not None:  # noqa: SIM102
+                if (
+                    hasattr(layer_cache, "keys") and layer_cache.keys is not None
+                ):  # noqa: SIM102
                     if layer_cache.keys.shape[0] != 1:
                         logger.debug(
                             f"Cache layer invalid: keys batch={layer_cache.keys.shape[0]}, expected 1"
@@ -2785,7 +2789,7 @@ class Scheduler:
             return self.prefix_cache.get_stats()
         return None
 
-    def clear_runtime_caches(self) -> Dict[str, bool]:
+    def clear_runtime_caches(self) -> dict[str, bool]:
         """Clear prefix-cache state without resetting scheduler/request state."""
         cleared = {
             "paged_cache": False,

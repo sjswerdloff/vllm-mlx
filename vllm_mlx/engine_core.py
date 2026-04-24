@@ -22,11 +22,11 @@ from typing import Any
 
 import mlx.core as mx
 
+from .mlx_streams import bind_generation_streams
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
-from .mlx_streams import bind_generation_streams
 
 logger = logging.getLogger(__name__)
 
@@ -575,7 +575,7 @@ class EngineCore:
         """Load prefix cache from disk."""
         return self.scheduler.load_cache_from_disk(cache_dir)
 
-    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
         return self.scheduler.clear_runtime_caches()
 
@@ -726,6 +726,6 @@ class AsyncEngineCore:
         """Load prefix cache from disk."""
         return self.engine.load_cache_from_disk(cache_dir)
 
-    def clear_runtime_caches(self) -> Dict[str, Any] | None:
+    def clear_runtime_caches(self) -> dict[str, Any] | None:
         """Clear scheduler-managed runtime caches."""
         return self.engine.clear_runtime_caches()

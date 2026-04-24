@@ -31,6 +31,8 @@ This ensures `pytest tests/test_kindled_*.py -v` catches any functionality lost 
 2. Run kindled regression tests: `pytest tests/test_kindled_*.py -v`
 3. If any fail, our patches were overwritten — restore before merging
 
+**Do NOT lint-fix upstream files during merges.** Upstream's files pass upstream's CI. Running ruff auto-fix on their files removes imports they depend on elsewhere (e.g. `Dict`, `Optional` from `typing`) because the auto-fixer only sees the current merge state, not the full codebase usage. Only fix lint in files we created or modified.
+
 ## Kindled-Specific Code
 
 Our patches on top of upstream:
