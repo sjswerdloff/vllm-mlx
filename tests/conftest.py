@@ -13,6 +13,12 @@ def pytest_addoption(parser):
         help="URL of the vllm-mlx server for integration tests",
     )
     parser.addoption(
+        "--model",
+        action="store",
+        default="default",
+        help="Model name for integration tests (default: whatever the server offers)",
+    )
+    parser.addoption(
         "--run-slow",
         action="store_true",
         default=False,
@@ -50,3 +56,15 @@ def pytest_collection_modifyitems(config, items):
 def server_url(request):
     """Get server URL from command line."""
     return request.config.getoption("--server-url")
+
+
+@pytest.fixture(scope="session")
+def model_name(request):
+    """Get model name from command line."""
+    return request.config.getoption("--model")
+
+
+@pytest.fixture(params=["asyncio"])
+def anyio_backend(request):
+    """Run anyio-marked tests on asyncio only (trio is not installed)."""
+    return request.param

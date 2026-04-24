@@ -95,6 +95,11 @@ class HermesToolParser(ToolParser):
         """
         Extract tool calls from a complete Hermes model response.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        if "<tool_call>" in model_output or '"name"' in model_output:
+            logger.info(f"[hermes_parser] input (last 500 chars): ...{model_output[-500:]}")
+
         tool_calls = []
         cleaned_text = model_output
 
@@ -136,8 +141,23 @@ class HermesToolParser(ToolParser):
             for name, params_block in nemotron_matches:
                 params = self.PARAM_PATTERN.findall(params_block)
                 arguments = {}
-                for p_name, p_value in params:
-                    arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                if params:
+                    for p_name, p_value in params:
+                        arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                else:
+                    # Hybrid format: Nemotron tags with JSON body instead of
+                    # <parameter> tags. Qwopus/Qwen3.5 produces this format.
+                    stripped = params_block.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, dict):
+                                # May contain "name" key that duplicates the
+                                # function name — remove it to get pure arguments
+                                parsed.pop("name", None)
+                                arguments = parsed
+                        except json.JSONDecodeError:
+                            pass
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
@@ -156,8 +176,19 @@ class HermesToolParser(ToolParser):
             for name, params_block in bare_matches:
                 params = self.PARAM_PATTERN.findall(params_block)
                 arguments = {}
-                for p_name, p_value in params:
-                    arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                if params:
+                    for p_name, p_value in params:
+                        arguments[p_name.strip()] = _parse_param_value(p_value.strip())
+                else:
+                    stripped = params_block.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, dict):
+                                parsed.pop("name", None)
+                                arguments = parsed
+                        except json.JSONDecodeError:
+                            pass
                 tool_calls.append(
                     {
                         "id": generate_tool_id(),
@@ -234,6 +265,7 @@ class HermesToolParser(ToolParser):
                 cleaned_text = f"(Reasoning: {reasoning_text})"
 
         if tool_calls:
+            logger.info(f"[hermes_parser] extracted {len(tool_calls)} tool calls: {tool_calls}")
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,

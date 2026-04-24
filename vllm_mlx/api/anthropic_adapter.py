@@ -9,6 +9,7 @@ Handles translation of:
 """
 
 import json
+import re
 import uuid
 
 from .anthropic_models import (
@@ -60,6 +61,10 @@ def anthropic_to_openai(request: AnthropicRequest) -> ChatCompletionRequest:
             system_text = "\n".join(parts)
         else:
             system_text = str(request.system)
+        # Strip per-request billing/tracking headers injected by some
+        # clients (e.g. Claude Code).  These contain a per-request hash
+        # that prevents prefix-cache reuse across turn boundaries.
+        system_text = re.sub(r"x-anthropic-billing-header:[^\n]*\n?", "", system_text)
         messages.append(Message(role="system", content=system_text))
 
     # Convert each message
@@ -172,13 +177,35 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
 
     # Content is a list of blocks
     messages = []
-    text_parts = []
+    # content_parts preserves ordering of text and images for multimodal messages
+    content_parts = []
+    has_images = False
     tool_calls_for_assistant = []
     tool_results = []
 
     for block in msg.content:
         if block.type == "text":
-            text_parts.append(block.text or "")
+            content_parts.append({"type": "text", "text": block.text or ""})
+
+        elif block.type == "image":
+            # Anthropic image → OpenAI image_url
+            # Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+            # OpenAI:    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+            source = block.source or {}
+            if source.get("type") == "base64":
+                media_type = source.get("media_type", "image/jpeg")
+                data = source.get("data", "")
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{data}"},
+                })
+                has_images = True
+            elif source.get("type") == "url":
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": source.get("url", "")},
+                })
+                has_images = True
 
         elif block.type == "tool_use":
             # Assistant message with tool calls
@@ -197,12 +224,23 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
         elif block.type == "tool_result":
             # Tool result → OpenAI tool message
             result_content = block.content
+            tool_result_images = []
             if isinstance(result_content, list):
-                # Extract text from content blocks
+                # Extract text and images from content blocks
                 parts = []
                 for item in result_content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         parts.append(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image":
+                        # Anthropic image in tool result → save for injection
+                        source = item.get("source", {})
+                        if source.get("type") == "base64":
+                            media_type = source.get("media_type", "image/jpeg")
+                            data = source.get("data", "")
+                            tool_result_images.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"},
+                            })
                     elif isinstance(item, str):
                         parts.append(item)
                 result_content = "\n".join(parts)
@@ -217,7 +255,19 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                 )
             )
 
+            # Images in tool results: OpenAI tool messages don't support
+            # multimodal content, so inject as a follow-up user message.
+            if tool_result_images:
+                image_parts = tool_result_images + [
+                    {"type": "text", "text": "[Image from tool result]"},
+                ]
+                tool_results.append(
+                    Message(role="user", content=image_parts)
+                )
+
     # Build the messages
+    text_parts = [p["text"] for p in content_parts if p["type"] == "text"]
+
     if msg.role == "assistant":
         combined_text = "\n".join(text_parts) if text_parts else None
         if tool_calls_for_assistant:
@@ -233,16 +283,18 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
         else:
             messages.append(Message(role="assistant", content=""))
     elif msg.role == "user":
-        # User messages: collect text parts, then add tool results separately
-        if text_parts:
+        if has_images:
+            # Multimodal: preserve content_parts list (text + images in order)
+            messages.append(Message(role="user", content=content_parts))
+        elif text_parts:
             combined_text = "\n".join(text_parts)
             messages.append(Message(role="user", content=combined_text))
 
         # Tool results become separate tool messages
         messages.extend(tool_results)
 
-        # If no text and no tool results, add empty user message
-        if not text_parts and not tool_results:
+        # If no content and no tool results, add empty user message
+        if not content_parts and not tool_results:
             messages.append(Message(role="user", content=""))
     else:
         # Other roles

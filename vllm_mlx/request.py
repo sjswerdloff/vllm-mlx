@@ -9,7 +9,7 @@ request management system, simplified for MLX backend.
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .paged_cache import BlockTable
@@ -37,7 +37,7 @@ class RequestStatus(enum.IntEnum):
         return status > RequestStatus.PREEMPTED
 
     @staticmethod
-    def get_finish_reason(status: "RequestStatus") -> Optional[str]:
+    def get_finish_reason(status: "RequestStatus") -> str | None:
         """Get the finish reason string for a finished status."""
         if status == RequestStatus.FINISHED_STOPPED:
             return "stop"
@@ -57,9 +57,10 @@ class SamplingParams:
     top_p: float = 0.9
     top_k: int = 0  # 0 means disabled
     min_p: float = 0.0
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
-    stop: Optional[list[str]] = None
-    stop_token_ids: Optional[list[int]] = None
+    stop: list[str] | None = None
+    stop_token_ids: list[int] | None = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -89,13 +90,13 @@ class Request:
     """
 
     request_id: str
-    prompt: Union[str, list[int]]
+    prompt: str | list[int]
     sampling_params: SamplingParams
     arrival_time: float = field(default_factory=time.time)
     priority: int = 0  # Lower is higher priority
 
     # Set after tokenization
-    prompt_token_ids: Optional[list[int]] = None
+    prompt_token_ids: list[int] | None = None
     num_prompt_tokens: int = 0
 
     # Generation state
@@ -105,12 +106,12 @@ class Request:
     output_text: str = ""
 
     # For BatchGenerator integration
-    batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
+    batch_uid: int | None = None  # UID assigned by BatchGenerator
 
     # Prefix cache fields
-    prompt_cache: Optional[list[Any]] = None  # Cached KV state from prefix cache
+    prompt_cache: list[Any] | None = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Number of tokens retrieved from cache
-    remaining_tokens: Optional[list[int]] = None  # Tokens still needing processing
+    remaining_tokens: list[int] | None = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
 
     # Paged cache fields (for BlockAwarePrefixCache)
@@ -118,32 +119,30 @@ class Request:
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
 
     # Multimodal content (images, video) - raw inputs
-    images: Optional[list[Any]] = None
-    videos: Optional[list[Any]] = None
+    images: list[Any] | None = None
+    videos: list[Any] | None = None
 
     # Processed multimodal inputs for VLM batching
-    pixel_values: Optional[Any] = None  # Processed image tensors (mx.array)
-    image_grid_thw: Optional[Any] = None  # Grid info for Qwen-VL models
-    attention_mask: Optional[Any] = None  # Attention mask for multimodal input
-    multimodal_kwargs: Optional[dict[str, Any]] = None  # Model-specific kwargs
+    pixel_values: Any | None = None  # Processed image tensors (mx.array)
+    image_grid_thw: Any | None = None  # Grid info for Qwen-VL models
+    attention_mask: Any | None = None  # Attention mask for multimodal input
+    multimodal_kwargs: dict[str, Any] | None = None  # Model-specific kwargs
     is_multimodal: bool = False  # Flag indicating this is a multimodal request
 
     # OpenAI-spec tool list for this request.  Used by guided decoding to
     # compile a per-request grammar constraint.  None means "no tools".
-    tools: Optional[list[dict[str, Any]]] = None
+    tools: list[dict[str, Any]] | None = None
 
     # Per-request logits processors attached by the scheduler (e.g. the
     # XGrammar structural-tag enforcer).  Consumed by BatchGenerator.insert.
-    logits_processors: Optional[list[Any]] = None
+    logits_processors: list[Any] | None = None
 
     # Metadata
-    finish_reason: Optional[str] = None
-    first_token_time: Optional[
-        float
-    ] = None  # Time when first output token was generated
-    cache_hit_type: Optional[
-        str
-    ] = None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
+    finish_reason: str | None = None
+    first_token_time: float | None = None  # Time when first output token was generated
+    cache_hit_type: str | None = (
+        None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
+    )
 
     @property
     def num_output_tokens(self) -> int:
@@ -164,7 +163,7 @@ class Request:
         """Check if request has finished."""
         return RequestStatus.is_finished(self.status)
 
-    def get_finish_reason(self) -> Optional[str]:
+    def get_finish_reason(self) -> str | None:
         """Get the finish reason if finished."""
         if self.finish_reason:
             return self.finish_reason
@@ -175,7 +174,7 @@ class Request:
         self.output_token_ids.append(token_id)
         self.num_computed_tokens += 1
 
-    def set_finished(self, status: RequestStatus, reason: Optional[str] = None) -> None:
+    def set_finished(self, status: RequestStatus, reason: str | None = None) -> None:
         """Mark the request as finished."""
         self.status = status
         self.finish_reason = reason or RequestStatus.get_finish_reason(status)
@@ -212,7 +211,7 @@ class RequestOutput:
     output_text: str = ""
     # Status
     finished: bool = False
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
     # Timing
     prompt_tokens: int = 0
     completion_tokens: int = 0
