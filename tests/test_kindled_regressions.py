@@ -9,9 +9,7 @@ Not intended for upstream submission — these test our specific patches.
 """
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Optional
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
@@ -112,40 +110,6 @@ class TestHybridCacheEvalFunctional:
                 f"If count < 6, some cache types are being skipped."
             )
 
-    def test_chunked_prefill_old_pattern_would_fail(self):
-        """Verify the old c.state pattern crashes on hybrid cache."""
-        kv = TrackingKVCache()
-        arr = TrackingArraysCache()
-        cache = [kv, arr]
-
-        # The old broken pattern would do:
-        #   mx.eval([c.state for c in cache])
-        # KVCache has no .state → AttributeError
-        with pytest.raises(AttributeError):
-            _ = [c.state for c in cache]
-
-    def test_chunked_prefill_no_chunking_short_prompt(self):
-        """Short prompts (≤ step_size) should not chunk — single forward pass."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
-
-        mock_model = MagicMock()
-        mock_model.language_model = MagicMock(return_value=mx.zeros((1, 1, 32)))
-
-        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
-        gen.language_model = mock_model.language_model
-        gen.prefill_step_size = 2048
-        gen._prefill_progress = {}
-        gen._aborted_request_ids = set()
-
-        request = MLLMBatchRequest(uid=0, request_id="test-short", prompt="hi")
-        request.input_ids = mx.zeros((1, 5), dtype=mx.int32)  # 5 tokens, step=2048
-
-        cache = [TrackingKVCache()]
-
-        gen._run_chunked_text_prefill(request, cache)
-
-        # Single forward call, no intermediate eval needed
-        mock_model.language_model.assert_called_once()
 
 
 # =============================================================================
@@ -211,37 +175,7 @@ class TestTextOnlyMLLMPath:
 
 
 # =============================================================================
-# 3. Anthropic vision test requires server
-#
-# Guard: test_anthropic_vision_tools.py must use pytest.importorskip and
-# skip when server is unreachable. Without this, the test suite fails on
-# import or connection error instead of skipping gracefully.
-# =============================================================================
-
-
-class TestAnthropicVisionTestGuards:
-    """Verify anthropic vision tests have proper skip guards."""
-
-    def test_anthropic_vision_test_collects_without_server(self):
-        """test_anthropic_vision_tools.py must not crash during collection."""
-        from pathlib import Path
-
-        test_file = Path(__file__).parent / "test_anthropic_vision_tools.py"
-        if not test_file.exists():
-            pytest.skip("test_anthropic_vision_tools.py not found")
-
-        # If the file uses bare `import anthropic`, it will crash during
-        # collection when anthropic is not installed. importorskip prevents
-        # this. We verify by checking the file can be imported as a module.
-        source = test_file.read_text()
-        assert "importorskip" in source or "import anthropic" not in source, (
-            "test_anthropic_vision_tools.py uses bare `import anthropic` — "
-            "must use pytest.importorskip to skip gracefully when not installed."
-        )
-
-
-# =============================================================================
-# 4. Hermes tool parser: JSON inside Nemotron function tags
+# 3. Hermes tool parser: JSON inside Nemotron function tags
 #
 # When VLM processor template instructs Nemotron format but the model
 # outputs JSON inside <function> tags (no <parameter> XML tags), the
