@@ -597,6 +597,8 @@ class TestVisionFeatureCacheIntegration:
         gen.prefill_step_size = 4
         gen._prefill_progress = {}
         gen._aborted_request_ids = set()
+        gen._think_suffix_len = 0
+        gen.session_cache = None
 
         # Create a mock vision feature cache
         mock_feature_cache = MagicMock()
@@ -648,6 +650,8 @@ class TestVisionFeatureCacheIntegration:
         gen.prefill_step_size = 4
         gen._prefill_progress = {}
         gen._aborted_request_ids = set()
+        gen._think_suffix_len = 0
+        gen.session_cache = None
 
         mock_feature_cache = MagicMock()
         gen._vision_feature_cache = mock_feature_cache

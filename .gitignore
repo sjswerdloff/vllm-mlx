@@ -96,3 +96,4 @@ temp/
 
 # MLX cache
 .mlx_cache/
+code-graph.db/
