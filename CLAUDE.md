@@ -39,6 +39,16 @@ Our patches on top of upstream:
 - **Nemotron/JSON hybrid parsing** in `tool_parsers/hermes_tool_parser.py` — JSON fallback when no `<parameter>` tags found
 - **Anthropic vision test skip** in `tests/test_anthropic_vision_tools.py` — `pytest.importorskip` + server connectivity check
 
+## Pre-commit Hooks
+
+**Never use `--no-verify`.** If mypy fails on pre-existing upstream issues, skip only mypy:
+
+```bash
+SKIP=mypy git commit -m "message"
+```
+
+This still runs ruff, ruff-format, trailing whitespace, merge conflict checks — everything except mypy.
+
 ## Commit Co-Authorship
 
 ```
