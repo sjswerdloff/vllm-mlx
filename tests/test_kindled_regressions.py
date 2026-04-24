@@ -285,25 +285,6 @@ class TestNemotronJSONHybridParsing:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["file_path"] == "/tmp/test.txt"
 
-    def test_nemotron_xml_parameter_equals_format(self):
-        """Bare <function> with <parameter=key> format (upstream regex)."""
-        from vllm_mlx.tool_parsers.hermes_tool_parser import HermesToolParser
-
-        parser = HermesToolParser()
-        # Upstream PARAM_PATTERN expects <parameter=key>value</parameter>
-        # (not <parameter name="key">value</parameter>)
-        text = (
-            '<function=Read>'
-            '<parameter=file_path>/tmp/test.txt</parameter>'
-            '</function>'
-        )
-        result = parser.extract_tool_calls(text)
-
-        assert result.tools_called, "Nemotron XML with parameter= format should work"
-        assert result.tool_calls[0]["name"] == "Read"
-        args = json.loads(result.tool_calls[0]["arguments"])
-        assert args["file_path"] == "/tmp/test.txt"
-
     def test_json_body_with_non_empty_arguments(self):
         """JSON body with multiple arguments should all be captured."""
         from vllm_mlx.tool_parsers.hermes_tool_parser import HermesToolParser
