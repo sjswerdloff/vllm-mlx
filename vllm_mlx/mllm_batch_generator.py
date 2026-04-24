@@ -137,7 +137,7 @@ class SessionKVCache:
         self._stats["hits"] += 1
         logger.info(
             f"[session_cache] Hit: prefix={best_prefix_len} "
-            f"remaining={len(remaining)} session={best_key[:12]}"
+            f"remaining={len(remaining)} session={best_key}"
         )
         return kv_cache, remaining, best_key
 
@@ -180,7 +180,7 @@ class SessionKVCache:
         self._stats["stores"] += 1
         logger.info(
             f"[session_cache] Stored {len(token_ids)} tokens, "
-            f"session={session_key[:12]}, active={len(self._sessions)}"
+            f"session={session_key}, active={len(self._sessions)}"
         )
         return session_key
 
@@ -316,7 +316,7 @@ class SessionKVCache:
                 loaded += 1
                 logger.info(
                     f"[session_persist] loaded session {i}: "
-                    f"{len(token_ids)} tokens, key={session_key[:12]}"
+                    f"{len(token_ids)} tokens, key={session_key}"
                 )
             except Exception as e:
                 logger.warning(f"[session_persist] failed to load session {i}: {e}")
@@ -1809,8 +1809,11 @@ class MLLMBatchGenerator:
                                             if S > 0
                                             else input_ids_list
                                         )
+                                        abort_key = SessionKVCache.make_session_key(
+                                            store_ids, has_images=bool(req.images)
+                                        )
                                         self.session_cache.store(
-                                            store_ids[:done], partial, session_key
+                                            store_ids[:done], partial, abort_key
                                         )
                                         logger.info(
                                             f"[session_cache] Saved partial resume: "
@@ -1952,11 +1955,12 @@ class MLLMBatchGenerator:
                     # Copy cache before storing — generation will mutate it
                     stored_cache = self._copy_prefix_cache(request_cache)
                     has_images = bool(req.images)
-                    if session_key is None:
-                        session_key = SessionKVCache.make_session_key(
-                            store_ids, has_images=has_images
-                        )
-                    self.session_cache.store(store_ids, stored_cache, session_key)
+                    # Always derive fresh key — never reuse the fetch key,
+                    # which may be from a different request type (vision vs text)
+                    store_key = SessionKVCache.make_session_key(
+                        store_ids, has_images=has_images
+                    )
+                    self.session_cache.store(store_ids, stored_cache, store_key)
 
             except PrefillAbortedError:
                 aborted_requests.append(req)
