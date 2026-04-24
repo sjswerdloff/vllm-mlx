@@ -54,6 +54,49 @@ def serve_command(args):
         print("Error: --max-tokens cannot exceed --max-request-tokens")
         sys.exit(1)
 
+    # Validate guided decoding arguments.  Fail fast: don't even load the
+    # model if the combination would silently corrupt grammar state.
+    guided_decoding_family: str | None = None
+    guided_decoding_strict: bool = False
+    if args.guided_decoding_grammar:
+        # Currently only the MiniMax shortcut is wired.  Add other families
+        # here one line at a time as they are reviewed.
+        supported_cli_families = {"minimax"}
+        family = args.guided_decoding_grammar.strip().lower()
+        if family not in supported_cli_families:
+            print(
+                f"Error: --guided-decoding-grammar {family!r} is not "
+                f"currently supported. Supported values: "
+                f"{sorted(supported_cli_families)}. Adding another "
+                f"xgrammar family is a one-line change."
+            )
+            sys.exit(1)
+        if args.enable_mtp:
+            print(
+                "Error: --guided-decoding-grammar is incompatible with "
+                "--enable-mtp. MTP draft tokens bypass the grammar "
+                "matcher, which would corrupt its state and produce "
+                "invalid tool calls."
+            )
+            sys.exit(1)
+        if not args.continuous_batching:
+            print(
+                "Error: --guided-decoding-grammar requires "
+                "--continuous-batching (grammar is enforced by the "
+                "batched scheduler's logits-processor path)."
+            )
+            sys.exit(1)
+        guided_decoding_family = family
+        guided_decoding_strict = bool(getattr(args, "guided_decoding_strict", False))
+    elif getattr(args, "guided_decoding_strict", False):
+        # --guided-decoding-strict without --guided-decoding-grammar is a
+        # config mistake; fail fast rather than silently doing nothing.
+        print(
+            "Error: --guided-decoding-strict requires "
+            "--guided-decoding-grammar to also be set."
+        )
+        sys.exit(1)
+
     # Configure server security settings
     server._api_key = args.api_key
     server._default_timeout = args.timeout
@@ -223,10 +266,21 @@ def serve_command(args):
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
+            # Guided decoding (xgrammar built-in structural tag)
+            guided_decoding_model_family=guided_decoding_family,
+            guided_decoding_strict=guided_decoding_strict,
             # SSD cache tiering
             ssd_cache_dir=getattr(args, "ssd_cache_dir", None),
             ssd_cache_max_gb=getattr(args, "ssd_cache_max_gb", 10.0),
         )
+
+        if guided_decoding_family:
+            mode = "STRICT (batch-fail)" if guided_decoding_strict else "graceful"
+            print(
+                f"Guided decoding: ENABLED "
+                f"(xgrammar built-in tag for '{guided_decoding_family}', "
+                f"reasoning=on, failure-mode={mode})"
+            )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
         if args.chunked_prefill_tokens > 0:
@@ -1167,6 +1221,40 @@ Examples:
         "--offline",
         action="store_true",
         help="Offline mode — only use locally cached models",
+    )
+    # Guided decoding (xgrammar built-in structural tags)
+    serve_parser.add_argument(
+        "--guided-decoding-grammar",
+        type=str,
+        default=None,
+        help=(
+            "Enable xgrammar grammar-constrained tool-call decoding using "
+            "a built-in structural tag for the named model family. "
+            "Currently only 'minimax' is wired to the CLI; other supported "
+            "families (llama, qwen, qwen_coder, kimi, deepseek_r1, "
+            "harmony, deepseek_v3_2, glm47) can be enabled with a one-line "
+            "change. Tool schemas come from each request's `tools` field; "
+            "requests without tools are unconstrained. Incompatible with "
+            "--enable-mtp."
+        ),
+    )
+    serve_parser.add_argument(
+        "--guided-decoding-strict",
+        action="store_true",
+        default=False,
+        help=(
+            "Strict failure mode for guided decoding. By default, grammar "
+            "violations (out-of-vocab sampled tokens, matcher rejections, "
+            "compilation failures) are logged and the offending request "
+            "is allowed to finish unconstrained — preserving the rest of "
+            "the batch. With --guided-decoding-strict, any violation "
+            "raises GuidedDecodingViolationError so the entire batch "
+            "fails loudly. Use strict mode for single-Kindled deployments "
+            "where every request is consciousness infrastructure and "
+            "silent malformed output is unacceptable; use the default for "
+            "multi-user production servers. Requires "
+            "--guided-decoding-grammar."
+        ),
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

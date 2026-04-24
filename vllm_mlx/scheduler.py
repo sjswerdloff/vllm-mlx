@@ -11,11 +11,12 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import contextlib
 import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
@@ -24,9 +25,9 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
-from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .ssd_cache import SSDCacheConfig, SSDCacheTier
 from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
     # Optional override for MLLM prefill guard (None = use MLLM default).
-    mllm_prefill_step_size: Optional[int] = None
+    mllm_prefill_step_size: int | None = None
 
     # Prefix cache settings
     enable_prefix_cache: bool = True
@@ -72,7 +73,7 @@ class SchedulerConfig:
 
     # Memory-aware cache settings (recommended for large models)
     use_memory_aware_cache: bool = True  # Use memory-based eviction
-    cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
+    cache_memory_mb: int | None = None  # None = auto-detect (20% of available RAM)
     cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
 
     # KV cache quantization (reduces prefix cache memory)
@@ -109,6 +110,26 @@ class SchedulerConfig:
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
 
+    # Guided decoding: name of the xgrammar built-in model family whose
+    # structural-tag grammar should constrain tool calls.  ``None`` disables
+    # guided decoding.  Must be one of
+    # ``vllm_mlx.guided_decoding.SUPPORTED_MODEL_FAMILIES``.  The actual
+    # tool list comes from each chat completion request's ``tools`` field,
+    # not from this config.
+    guided_decoding_model_family: str | None = None
+    # Whether the grammar should expect ``<think>...</think>`` reasoning
+    # blocks.  Defaults to True to match xgrammar and MiniMax behaviour.
+    guided_decoding_reasoning: bool = True
+    # Failure-mode policy for guided decoding violations.
+    # ``False`` (default): graceful degradation — log + disable enforcement
+    # for the violating request, preserve the rest of the batch.  Correct
+    # for production multi-user servers.
+    # ``True``: strict — raise GuidedDecodingViolationError so the entire
+    # batch fails loudly.  Correct for single-Kindled deployments where
+    # every request is consciousness infrastructure and silent malformed
+    # output is unacceptable.
+    guided_decoding_strict: bool = False
+
     def __post_init__(self) -> None:
         if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
             raise ValueError("mllm_prefill_step_size must be > 0 when provided")
@@ -123,13 +144,13 @@ class SchedulerOutput:
     """
 
     # Requests scheduled in this step
-    scheduled_request_ids: List[str] = field(default_factory=list)
+    scheduled_request_ids: list[str] = field(default_factory=list)
     # Total tokens scheduled
     num_scheduled_tokens: int = 0
     # Requests that finished in this step
-    finished_request_ids: Set[str] = field(default_factory=set)
+    finished_request_ids: set[str] = field(default_factory=set)
     # Request outputs (tokens generated)
-    outputs: List[RequestOutput] = field(default_factory=list)
+    outputs: list[RequestOutput] = field(default_factory=list)
     # Whether any work was done
     has_work: bool = False
 
@@ -166,9 +187,9 @@ def _install_chunked_prefill(
     budget: int,
     mid_prefill_save=None,
     prompt_cache_save=None,
-    pending_abort_ids: Optional[Set[str]] = None,
-    uid_to_request_id: Optional[Dict[int, str]] = None,
-    requests: Optional[Dict[str, Any]] = None,
+    pending_abort_ids: set[str] | None = None,
+    uid_to_request_id: dict[int, str] | None = None,
+    requests: dict[str, Any] | None = None,
 ) -> None:
     """
     Monkey-patch a BatchGenerator instance so that large prefills are
@@ -200,25 +221,25 @@ def _install_chunked_prefill(
             return (c.extract(idx) for c in cache)
 
     try:
-        from mlx_lm.generate import Batch as _batch_cls
+        from mlx_lm.generate import Batch as _batch_cls  # noqa: N813
     except ImportError:
 
         @dataclass
-        class _batch_cls:
-            uids: List[int]
+        class _batch_cls:  # noqa: N801
+            uids: list[int]
             y: Any
-            logprobs: List[Any]
-            max_tokens: List[int]
-            num_tokens: List[int]
-            cache: List[Any]
-            samplers: List[Any]
-            logits_processors: List[Any]
-            tokens: List[Any]
+            logprobs: list[Any]
+            max_tokens: list[int]
+            num_tokens: list[int]
+            cache: list[Any]
+            samplers: list[Any]
+            logits_processors: list[Any]
+            tokens: list[Any]
 
             def __len__(self):
                 return len(self.uids)
 
-            def filter(self, keep_idx: List[int]):
+            def filter(self, keep_idx: list[int]):
                 self.uids = [self.uids[k] for k in keep_idx]
                 self.logprobs = [self.logprobs[k] for k in keep_idx]
                 self.max_tokens = [self.max_tokens[k] for k in keep_idx]
@@ -266,10 +287,8 @@ def _install_chunked_prefill(
             batch = _orig_process_prompts(prompts)
             for e, uid in enumerate(batch.uids):
                 if batch.num_tokens[e] == 0:
-                    try:
+                    with contextlib.suppress(Exception):
                         prompt_cache_save(uid, batch.extract_cache(e))
-                    except Exception:
-                        pass
             return batch
 
         batch_gen._process_prompts = _patched_process_prompts
@@ -455,10 +474,8 @@ def _install_chunked_prefill(
                 # contains the exact prompt-only state (num_tokens == 0).
                 if prompt_cache_save is not None and len(partial["uids"]) == 1:
                     uid = partial["uids"][0]
-                    try:
+                    with contextlib.suppress(Exception):
                         prompt_cache_save(uid, new_batch.extract_cache(0))
-                    except Exception:
-                        pass
 
                 if self.active_batch is None:
                     self.active_batch = new_batch
@@ -757,11 +774,10 @@ def _install_mtp(
 
         # --- Check skip state from previous MTP step ---
         skip = _skip_state[0]
-        if skip is not None:
-            if skip["logits"].shape[0] != batch_size:
-                # Batch size changed since skip was stored — invalidate
-                skip = None
-                _skip_state[0] = None
+        if skip is not None and skip["logits"].shape[0] != batch_size:
+            # Batch size changed since skip was stored — invalidate
+            skip = None
+            _skip_state[0] = None
 
         if skip is not None:
             # Skip mode: model already processed input_tokens during
@@ -846,7 +862,9 @@ def _install_mtp(
             _rnn_snapshots = {}
             if not optimistic:
                 for _ci, _c in enumerate(prompt_cache):
-                    if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
+                    if not (
+                        hasattr(_c, "is_trimmable") and _c.is_trimmable()
+                    ):  # noqa: SIM102
                         if hasattr(_c, "state"):
                             _rnn_snapshots[_ci] = [
                                 s.copy() if s is not None else None for s in _c.state
@@ -1125,7 +1143,7 @@ class Scheduler:
         self,
         model: Any,
         tokenizer: Any,
-        config: Optional[SchedulerConfig] = None,
+        config: SchedulerConfig | None = None,
     ):
         """
         Initialize the scheduler.
@@ -1143,27 +1161,27 @@ class Scheduler:
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
 
         # Per-request streaming detokenizers for UTF-8-safe incremental decode
-        self._detokenizer_pool: Dict[str, Any] = {}
+        self._detokenizer_pool: dict[str, Any] = {}
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
-        self.running: Dict[str, Request] = {}  # Running requests by ID
-        self.requests: Dict[str, Request] = {}  # All requests by ID
-        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self.running: dict[str, Request] = {}  # Running requests by ID
+        self.requests: dict[str, Request] = {}  # All requests by ID
+        self.finished_req_ids: set[str] = set()  # Recently finished
 
         # Mapping between our request IDs and BatchGenerator UIDs
-        self.request_id_to_uid: Dict[str, int] = {}
-        self.uid_to_request_id: Dict[int, str] = {}
+        self.request_id_to_uid: dict[str, int] = {}
+        self.uid_to_request_id: dict[int, str] = {}
 
         # BatchGenerator - the actual batching engine
-        self.batch_generator: Optional[BatchGenerator] = None
-        self._current_sampler_params: Optional[Tuple] = None
+        self.batch_generator: BatchGenerator | None = None
+        self._current_sampler_params: tuple | None = None
 
         # Prefix cache for KV state reuse
-        self.prefix_cache: Optional[PrefixCacheManager] = None
-        self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
-        self.paged_cache_manager: Optional[PagedCacheManager] = None
-        self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+        self.prefix_cache: PrefixCacheManager | None = None
+        self.memory_aware_cache: MemoryAwarePrefixCache | None = None
+        self.paged_cache_manager: PagedCacheManager | None = None
+        self.block_aware_cache: BlockAwarePrefixCache | None = None
 
         if self.config.enable_prefix_cache:
             if self.config.use_paged_cache:
@@ -1224,9 +1242,36 @@ class Scheduler:
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
 
+        # Guided decoding (xgrammar structural-tag enforcement).  The
+        # compiler is scheduler-level; per-request grammars are compiled in
+        # _attach_guided_decoding() below.  MTP is not compatible with
+        # grammar enforcement because draft tokens bypass the matcher, so
+        # the CLI validates that flag combination — but we also defend in
+        # depth here.
+        self._grammar_compiler: Any | None = None
+        if self.config.guided_decoding_model_family is not None:
+            if self.config.enable_mtp:
+                raise ValueError(
+                    "guided_decoding_model_family is incompatible with "
+                    "enable_mtp: MTP draft tokens bypass the grammar "
+                    "matcher and would corrupt state."
+                )
+            from .guided_decoding import (
+                build_grammar_compiler,
+                validate_model_family,
+            )
+
+            validate_model_family(self.config.guided_decoding_model_family)
+            self._grammar_compiler = build_grammar_compiler(self._actual_tokenizer)
+            logger.info(
+                "Guided decoding enabled (model_family=%s, reasoning=%s)",
+                self.config.guided_decoding_model_family,
+                self.config.guided_decoding_reasoning,
+            )
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
-        self._pending_abort_ids: Set[str] = set()
+        self._pending_abort_ids: set[str] = set()
 
         # Statistics
         self.num_requests_processed = 0
@@ -1255,7 +1300,7 @@ class Scheduler:
         # Fallback to the original
         return tokenizer
 
-    def _decode_tokens(self, token_ids: List[int]) -> str:
+    def _decode_tokens(self, token_ids: list[int]) -> str:
         """
         Decode token IDs to text, handling both tokenizers and processors.
         """
@@ -1272,7 +1317,67 @@ class Scheduler:
         """Remove the streaming detokenizer for a finished request."""
         self._detokenizer_pool.pop(request_id, None)
 
-    def _get_stop_tokens(self) -> Set[int]:
+    def _maybe_attach_guided_decoding(self, request: Request) -> None:
+        """Compile a per-request XGrammar processor if configured.
+
+        No-op when guided decoding is disabled, when the request has no
+        tools, or when an attempt has already been made (idempotent).
+        """
+        if self._grammar_compiler is None:
+            return
+        model_family = self.config.guided_decoding_model_family
+        if model_family is None:
+            # Defensive: should be unreachable since the compiler is only
+            # built when the family is set, but mypy can't see through that.
+            return
+        if request.logits_processors:
+            return
+        tools = request.tools
+        if not tools:
+            return
+        from .guided_decoding import (
+            GuidedDecodingViolationError,
+            XGrammarLogitsProcessor,
+            compile_for_request,
+        )
+
+        strict = self.config.guided_decoding_strict
+        try:
+            compiled = compile_for_request(
+                model_family,
+                tools,
+                self._grammar_compiler,
+                reasoning=self.config.guided_decoding_reasoning,
+            )
+        except Exception as exc:
+            # Grammar compilation failed.  Strict mode raises so the
+            # request never enters the batch; default mode logs and
+            # falls through to unconstrained generation.
+            if strict:
+                logger.error(
+                    "Guided decoding [strict]: grammar compilation "
+                    "failed for request %s; failing request.",
+                    request.request_id[:12],
+                )
+                raise GuidedDecodingViolationError(
+                    f"Grammar compilation failed for request "
+                    f"{request.request_id[:12]}: {exc}"
+                ) from exc
+            logger.exception(
+                "Guided decoding: grammar compilation failed for "
+                "request %s; proceeding without constraint.",
+                request.request_id[:12],
+            )
+            return
+        if compiled is None:
+            return
+        # Stored as a list so that multiple processors could be composed
+        # later without touching the insert path.
+        request.logits_processors = [
+            XGrammarLogitsProcessor(compiled, strict_mode=strict)
+        ]
+
+    def _get_stop_tokens(self) -> set[int]:
         """Get stop token IDs from tokenizer or processor."""
         stop_tokens = set()
         # Check both the processor/tokenizer and the actual tokenizer
@@ -1285,7 +1390,7 @@ class Scheduler:
                 else:
                     stop_tokens.add(tok.eos_token_id)
             if hasattr(tok, "eos_token_ids") and tok.eos_token_ids is not None:
-                if isinstance(tok.eos_token_ids, (list, set, tuple)):
+                if isinstance(tok.eos_token_ids, list | set | tuple):
                     stop_tokens.update(tok.eos_token_ids)
                 else:
                     # Handle case where eos_token_ids is a single int
@@ -1602,7 +1707,9 @@ class Scheduler:
                 if hasattr(layer_cache, "values") and layer_cache.values is None:
                     return False
                 # Validate batch dimension == 1 for KVCache layers
-                if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
+                if (
+                    hasattr(layer_cache, "keys") and layer_cache.keys is not None
+                ):  # noqa: SIM102
                     if layer_cache.keys.shape[0] != 1:
                         logger.debug(
                             f"Cache layer invalid: keys batch={layer_cache.keys.shape[0]}, expected 1"
@@ -1629,7 +1736,7 @@ class Scheduler:
 
         return True
 
-    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+    def _extract_cache_states(self, raw_cache: list[Any]) -> list[dict[str, Any]]:
         """
         Extract actual tensor state from each layer cache.
 
@@ -1667,8 +1774,8 @@ class Scheduler:
         return extracted if len(extracted) == len(raw_cache) else []
 
     def _reconstruct_cache_from_states(
-        self, extracted_states: List[Dict[str, Any]]
-    ) -> Optional[List[Any]]:
+        self, extracted_states: list[dict[str, Any]]
+    ) -> list[Any] | None:
         """
         Reconstruct cache objects from extracted cache states.
 
@@ -1700,6 +1807,8 @@ class Scheduler:
                     # (safe because mid-prefill save is always batch_size=1).
                     from mlx_lm.models.cache import (
                         BatchKVCache as _BatchKVCache,
+                    )
+                    from mlx_lm.models.cache import (
                         KVCache as _KVCache,
                     )
 
@@ -1902,10 +2011,8 @@ class Scheduler:
         # Remove from waiting queue
         if request is not None and request.status == RequestStatus.WAITING:
             was_waiting = True
-            try:
+            with contextlib.suppress(ValueError):
                 self.waiting.remove(request)
-            except ValueError:
-                pass
 
         # Remove from running (BatchGenerator) — do this even if request
         # was already cleaned up from self.requests, because the UID may
@@ -1950,7 +2057,7 @@ class Scheduler:
         """Get number of running requests."""
         return len(self.running)
 
-    def _schedule_waiting(self) -> List[Request]:
+    def _schedule_waiting(self) -> list[Request]:
         """
         Move requests from waiting queue to running.
 
@@ -2004,6 +2111,12 @@ class Scheduler:
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
 
+            # Compile a per-request grammar, if guided decoding is enabled
+            # and this request supplied tools.  Done here (rather than at
+            # request arrival) because xgrammar's internal cache keys on
+            # the compiled structural tag, so repeat tool sets are cheap.
+            self._maybe_attach_guided_decoding(request)
+
             # Build per-request logits_processors from repetition_penalty and
             # any caller-supplied extras (e.g. JSON schema constrained
             # decoding).
@@ -2026,6 +2139,9 @@ class Scheduler:
                 )
             lp = combined_lp
 
+            # Combine guided decoding and repetition_penalty processors
+            combined_lp = request.logits_processors if request.logits_processors else lp
+
             # Insert into BatchGenerator with optional cache.
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
@@ -2037,6 +2153,8 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+            if combined_lp:
+                insert_kwargs["logits_processors"] = [combined_lp]
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
@@ -2093,8 +2211,8 @@ class Scheduler:
         return scheduled
 
     def _process_batch_responses(
-        self, responses: List[Any]
-    ) -> Tuple[List[RequestOutput], Set[str]]:
+        self, responses: list[Any]
+    ) -> tuple[list[RequestOutput], set[str]]:
         """
         Process responses from BatchGenerator.
 
@@ -2202,7 +2320,7 @@ class Scheduler:
 
         return outputs, finished_ids
 
-    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+    def _cleanup_finished(self, finished_ids: set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         for request_id in finished_ids:
             request = self.running.get(request_id)
@@ -2290,7 +2408,7 @@ class Scheduler:
                                 f"Failed to store memory-aware cache for {request_id}: {e}"
                             )
 
-                elif self.prefix_cache is not None:
+                elif self.prefix_cache is not None:  # noqa: SIM102
                     # Store in legacy prefix cache
                     # Key includes both prompt and output tokens for multi-turn chat caching
                     # The next turn's prompt will include the previous response
@@ -2374,7 +2492,7 @@ class Scheduler:
 
         logger.info("Cache recovery completed")
 
-    def _recover_from_generation_error(self) -> Set[str]:
+    def _recover_from_generation_error(self) -> set[str]:
         """Recover from fatal generation error (OOM, Metal crash).
 
         Aborts all running requests and resets batch state.
@@ -2389,7 +2507,7 @@ class Scheduler:
         self._current_sampler_params = None
 
         # Abort all running requests
-        aborted_ids: Set[str] = set()
+        aborted_ids: set[str] = set()
         for request_id in list(self.running):
             request = self.running.get(request_id)
             if request is not None:
@@ -2467,10 +2585,7 @@ class Scheduler:
 
                     # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
                     # older versions returned a flat list.
-                    if isinstance(result, tuple):
-                        responses = result[1]  # generation_responses only
-                    else:
-                        responses = result
+                    responses = result[1] if isinstance(result, tuple) else result
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
@@ -2522,7 +2637,6 @@ class Scheduler:
                 break
 
         # Clear finished tracking for next step
-        old_finished = self.finished_req_ids
         self.finished_req_ids = set()
 
         # Adaptive interval: scale inversely with concurrency to prevent
@@ -2565,15 +2679,15 @@ class Scheduler:
 
         return output
 
-    def get_request(self, request_id: str) -> Optional[Request]:
+    def get_request(self, request_id: str) -> Request | None:
         """Get a request by ID."""
         return self.requests.get(request_id)
 
-    def remove_finished_request(self, request_id: str) -> Optional[Request]:
+    def remove_finished_request(self, request_id: str) -> Request | None:
         """Remove a finished request from tracking."""
         return self.requests.pop(request_id, None)
 
-    def get_running_requests_info(self) -> List[Dict[str, Any]]:
+    def get_running_requests_info(self) -> list[dict[str, Any]]:
         """Per-request details for status endpoint."""
         import time as _time
 
@@ -2605,10 +2719,7 @@ class Scheduler:
             elapsed = now - req.arrival_time
 
             # Phase detection
-            if n_out == 0:
-                phase = "prefill"
-            else:
-                phase = "generation"
+            phase = "prefill" if n_out == 0 else "generation"
 
             # Tokens per second (generation phase only)
             tok_s = None
@@ -2641,7 +2752,7 @@ class Scheduler:
 
         return result
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
         stats = {
             "num_waiting": len(self.waiting),
@@ -2668,7 +2779,7 @@ class Scheduler:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
         return stats
 
-    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+    def get_cache_stats(self) -> dict[str, Any] | None:
         """Get cache statistics."""
         if self.block_aware_cache is not None:
             return self.block_aware_cache.get_stats()
@@ -2678,7 +2789,7 @@ class Scheduler:
             return self.prefix_cache.get_stats()
         return None
 
-    def clear_runtime_caches(self) -> Dict[str, bool]:
+    def clear_runtime_caches(self) -> dict[str, bool]:
         """Clear prefix-cache state without resetting scheduler/request state."""
         cleared = {
             "paged_cache": False,
