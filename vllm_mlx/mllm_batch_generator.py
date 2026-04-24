@@ -1149,6 +1149,15 @@ class MLLMBatchGenerator:
                 return output.logits
             return output
 
+        # Derive session key for incremental storage on abort
+        input_ids_list = input_ids.reshape(-1).tolist()
+        S = self._think_suffix_len
+        session_ids_full = input_ids_list[:-S] if S > 0 else input_ids_list
+        session_key = None
+        if self.session_cache is not None:
+            prefix_tokens = session_ids_full[:256]
+            session_key = str(hash(tuple(prefix_tokens)))
+
         # Process all chunks except the last
         processed = 0
         chunk_count = 0
@@ -1160,6 +1169,15 @@ class MLLMBatchGenerator:
                     f"[chunked_prefill] Aborted {request.request_id} at "
                     f"{processed}/{total} tokens"
                 )
+                if self.session_cache is not None and cache:
+                    partial_cache = self._copy_prefix_cache(cache)
+                    self.session_cache.store(
+                        session_ids_full[:processed], partial_cache, session_key
+                    )
+                    logger.info(
+                        f"[session_cache] Saved partial prefill: "
+                        f"{processed}/{total} tokens before abort"
+                    )
                 raise PrefillAbortedError(request.request_id)
 
             chunk = input_ids[:, processed : processed + step]
@@ -1283,6 +1301,18 @@ class MLLMBatchGenerator:
         inputs_embeds = embed_output.inputs_embeds
         mx.eval(inputs_embeds)
 
+        # Derive session key for incremental storage during chunked loop.
+        # Store the cache reference (no copy) after each chunk so that if
+        # the client disconnects, the next request picks up where we left
+        # off instead of starting from scratch.
+        input_ids_list = input_ids.reshape(-1).tolist()
+        S = self._think_suffix_len
+        session_ids_full = input_ids_list[:-S] if S > 0 else input_ids_list
+        session_key = None
+        if self.session_cache is not None:
+            prefix_tokens = session_ids_full[:256]
+            session_key = str(hash(tuple(prefix_tokens)))
+
         # Chunked LLM forward on merged embeddings
         processed = 0
         chunk_count = 0
@@ -1294,6 +1324,17 @@ class MLLMBatchGenerator:
                     f"[vision_chunked] Aborted {request.request_id} at "
                     f"{processed}/{total} tokens"
                 )
+                # Store partial progress before raising — the cache reference
+                # holds the KV state for all processed tokens so far.
+                if self.session_cache is not None and cache:
+                    partial_cache = self._copy_prefix_cache(cache)
+                    self.session_cache.store(
+                        session_ids_full[:processed], partial_cache, session_key
+                    )
+                    logger.info(
+                        f"[session_cache] Saved partial prefill: "
+                        f"{processed}/{total} tokens before abort"
+                    )
                 raise PrefillAbortedError(request.request_id)
 
             chunk_embeds = inputs_embeds[:, processed : processed + step, :]
