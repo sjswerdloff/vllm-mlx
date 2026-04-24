@@ -979,7 +979,18 @@ class MLLMBatchGenerator:
 
             chunk = input_ids[:, processed : processed + step]
             self.language_model(chunk, cache=cache)
-            mx.eval([c.state for c in cache])
+            # Eval ALL cache types to break the lazy graph between chunks.
+            # ArraysCache (e.g. GatedDeltaNet) has .state; KVCache (full
+            # attention) has .keys/.values. Hybrid models like Qwen3.5 use
+            # both. Skipping either type lets the computation graph grow
+            # across chunks → OOM on long prompts.
+            cache_tensors = []
+            for c in cache:
+                if hasattr(c, "keys") and c.keys is not None:
+                    cache_tensors.extend([c.keys, c.values])
+                elif hasattr(c, "state"):
+                    cache_tensors.extend([s for s in c.state if s is not None])
+            mx.eval(cache_tensors)
             processed += step
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
@@ -1266,7 +1277,16 @@ class MLLMBatchGenerator:
 
                                 chunk = remaining[:, processed : processed + step]
                                 self.language_model(chunk, cache=request_cache)
-                                mx.eval([c.state for c in request_cache])
+                                # Eval ALL cache types (see _run_chunked_text_prefill)
+                                cache_tensors = []
+                                for c in request_cache:
+                                    if hasattr(c, "keys") and c.keys is not None:
+                                        cache_tensors.extend([c.keys, c.values])
+                                    elif hasattr(c, "state"):
+                                        cache_tensors.extend(
+                                            [s for s in c.state if s is not None]
+                                        )
+                                mx.eval(cache_tensors)
                                 processed += step
                                 chunk_count += 1
                                 self._prefill_progress[req.request_id] = (
