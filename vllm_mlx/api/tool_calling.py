@@ -14,7 +14,7 @@ Also includes structured output (JSON Schema) utilities:
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from jsonschema import ValidationError, validate
 

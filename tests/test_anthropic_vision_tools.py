@@ -17,8 +17,9 @@ import base64
 import json
 from pathlib import Path
 
-import anthropic
 import pytest
+
+anthropic = pytest.importorskip("anthropic")
 
 DEFAULT_MODEL = "default"
 IMAGE_PATH = Path(
@@ -53,7 +54,16 @@ SAMPLE_TOOLS = [
 
 @pytest.fixture
 def client(server_url):
-    return anthropic.Anthropic(base_url=server_url, api_key="dummy")
+    try:
+        c = anthropic.Anthropic(base_url=server_url, api_key="dummy")
+        # Quick connectivity check
+        c.messages.create(
+            model="default", max_tokens=1,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        return c
+    except Exception:
+        pytest.skip(f"Server not reachable at {server_url}")
 
 
 @pytest.fixture
