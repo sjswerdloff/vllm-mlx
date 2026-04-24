@@ -1101,6 +1101,16 @@ class MLLMBatchGenerator:
         # Long prompt with vision: separate ViT encoding from LLM forward.
         # 1) Run get_input_embeddings to encode images + merge into embeddings
         # 2) Chunk the LLM forward on the merged embeddings
+
+        # Check for abort before expensive ViT encoding
+        if request.request_id in self._aborted_request_ids:
+            self._aborted_request_ids.discard(request.request_id)
+            logger.info(
+                f"[vision_chunked] Aborted {request.request_id} before "
+                f"vision encoding ({total} tokens)"
+            )
+            raise PrefillAbortedError(request.request_id)
+
         logger.info(
             f"[vision_chunked] {total} tokens — encoding vision then chunking LLM"
         )
@@ -1113,6 +1123,15 @@ class MLLMBatchGenerator:
         processed = 0
         chunk_count = 0
         while processed + step < total:
+            # Check for abort between chunks (client disconnect)
+            if request.request_id in self._aborted_request_ids:
+                self._aborted_request_ids.discard(request.request_id)
+                logger.info(
+                    f"[vision_chunked] Aborted {request.request_id} at "
+                    f"{processed}/{total} tokens"
+                )
+                raise PrefillAbortedError(request.request_id)
+
             chunk_embeds = inputs_embeds[:, processed : processed + step, :]
             self.language_model(
                 input_ids[:, processed : processed + step],
