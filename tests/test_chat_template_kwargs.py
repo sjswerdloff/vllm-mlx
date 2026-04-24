@@ -70,7 +70,11 @@ def test_batched_engine_mllm_falls_back_to_tokenizer_when_processor_has_no_templ
         )
 
         assert prompt == "prompt-from-tokenizer"
-        processor.apply_chat_template.assert_called_once()
+        # Text-only requests on MLLM models skip the processor entirely
+        # (num_images == 0), falling back to the tokenizer directly.
+        # This avoids processor template incompatibilities with tool-use
+        # formats (e.g. Anthropic API tool_result blocks).
+        processor.apply_chat_template.assert_not_called()
         tokenizer.apply_chat_template.assert_called_once()
 
 

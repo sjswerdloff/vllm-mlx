@@ -246,6 +246,10 @@ class TestBatchingPerformance:
                 tokens = await asyncio.gather(*[get_output(r) for r in request_ids])
                 return sum(tokens)
 
+        # Warm-up: run once each to compile kernels and avoid first-run overhead
+        await run_sequential()
+        await run_batched()
+
         # Time sequential
         start = time.perf_counter()
         seq_tokens = await run_sequential()
@@ -256,7 +260,7 @@ class TestBatchingPerformance:
         batch_tokens = await run_batched()
         batch_time = time.perf_counter() - start
 
-        # Batched should be faster (at least 1.5x)
+        # Batched should have better throughput (allow 10% tolerance for variance)
         seq_throughput = seq_tokens / seq_time
         batch_throughput = batch_tokens / batch_time
 
@@ -264,7 +268,6 @@ class TestBatchingPerformance:
         print(f"Batched: {batch_throughput:.1f} tok/s")
         print(f"Speedup: {batch_throughput/seq_throughput:.2f}x")
 
-        # Batched should have better throughput (allow 10% tolerance for variance)
         assert batch_throughput > seq_throughput * 0.9, (
             f"Batched ({batch_throughput:.1f} tok/s) should be faster than "
             f"sequential ({seq_throughput:.1f} tok/s)"
