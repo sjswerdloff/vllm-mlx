@@ -12,8 +12,6 @@ import json
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
-import pytest
-
 
 # =============================================================================
 # 1. Hybrid cache eval in chunked prefill
@@ -78,7 +76,9 @@ class TestHybridCacheEvalFunctional:
             request_id="test-hybrid",
             prompt="test",
         )
-        request.input_ids = mx.zeros((1, 12), dtype=mx.int32)  # 12 tokens, step=4 → 2 chunks + last
+        request.input_ids = mx.zeros(
+            (1, 12), dtype=mx.int32
+        )  # 12 tokens, step=4 → 2 chunks + last
 
         # Hybrid cache: KVCache + ArraysCache + KVCache
         kv1 = TrackingKVCache()
@@ -100,16 +100,15 @@ class TestHybridCacheEvalFunctional:
         # Should have eval'd between chunks.
         # 3 cache objects: 2 KVCache (2 tensors each) + 1 ArraysCache (2 state entries)
         # = 6 tensors per eval call, called twice (2 intermediate chunks before last)
-        assert len(eval_calls) >= 2, (
-            f"Expected at least 2 inter-chunk evals, got {len(eval_calls)}"
-        )
+        assert (
+            len(eval_calls) >= 2
+        ), f"Expected at least 2 inter-chunk evals, got {len(eval_calls)}"
         for i, count in enumerate(eval_calls):
             assert count == 6, (
                 f"Eval call {i} got {count} tensors, expected 6 "
                 f"(2 KVCache × 2 + 1 ArraysCache × 2). "
                 f"If count < 6, some cache types are being skipped."
             )
-
 
 
 # =============================================================================
@@ -278,8 +277,8 @@ class TestPrefixCacheVisionHistory:
         kv = self._make_fake_kv()
 
         # First request: store 100 tokens (includes image token 151646 at position 50)
-        IMG_TOKEN = 151646
-        tokens_1 = list(range(50)) + [IMG_TOKEN] + list(range(51, 100))
+        img_token = 151646
+        tokens_1 = list(range(50)) + [img_token] + list(range(51, 100))
         cache.store(tokens_1, kv)
 
         # Second request: same 100 tokens prefix + 10 new text tokens
@@ -291,9 +290,9 @@ class TestPrefixCacheVisionHistory:
             "If this fails, vision requests with images in history will "
             "re-prefill the entire context on every request."
         )
-        assert len(remaining) == 10, (
-            f"Expected 10 remaining tokens, got {len(remaining)}"
-        )
+        assert (
+            len(remaining) == 10
+        ), f"Expected 10 remaining tokens, got {len(remaining)}"
 
     def test_image_token_in_remaining_clears_hit(self):
         """If image tokens are in the REMAINING portion, cache hit must clear.
@@ -303,14 +302,14 @@ class TestPrefixCacheVisionHistory:
         cache = self._make_cache()
         kv = self._make_fake_kv()
 
-        IMG_TOKEN = 151646
+        img_token = 151646
 
         # Store 100 text-only tokens
         tokens_1 = list(range(100))
         cache.store(tokens_1, kv)
 
         # New request: same 100 prefix + 10 tokens INCLUDING image token
-        tokens_2 = tokens_1 + [200, 201, IMG_TOKEN, 203, 204, 205, 206, 207, 208, 209]
+        tokens_2 = tokens_1 + [200, 201, img_token, 203, 204, 205, 206, 207, 208, 209]
         cached_kv, remaining = cache.fetch(tokens_2)
 
         # Cache DOES hit at the fetch level
@@ -319,10 +318,8 @@ class TestPrefixCacheVisionHistory:
         # But the image token guard in mllm_batch_generator should clear it.
         # We test the guard logic directly:
         if cached_kv is not None and remaining:
-            has_image_in_remaining = IMG_TOKEN in remaining
-            assert has_image_in_remaining, (
-                "Image token should be in remaining tokens"
-            )
+            has_image_in_remaining = img_token in remaining
+            assert has_image_in_remaining, "Image token should be in remaining tokens"
             # This is where mllm_batch_generator clears the hit —
             # correct behavior, can't use language-model-only path
 
@@ -331,8 +328,8 @@ class TestPrefixCacheVisionHistory:
         cache = self._make_cache()
         kv = self._make_fake_kv()
 
-        IMG_TOKEN = 151646
-        tokens = list(range(50)) + [IMG_TOKEN] + list(range(51, 100))
+        img_token = 151646
+        tokens = list(range(50)) + [img_token] + list(range(51, 100))
 
         cache.store(tokens, kv)
         cached_kv, remaining = cache.fetch(tokens)

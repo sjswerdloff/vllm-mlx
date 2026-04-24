@@ -186,9 +186,9 @@ class TestNormalChatUnaffected:
         )
         choice = result["choices"][0]
         tool_calls = choice["message"].get("tool_calls")
-        assert tool_calls is None or len(tool_calls) == 0, (
-            f"Normal chat produced unexpected tool_calls: {tool_calls}"
-        )
+        assert (
+            tool_calls is None or len(tool_calls) == 0
+        ), f"Normal chat produced unexpected tool_calls: {tool_calls}"
 
     def test_streaming_chat_produces_content(self, server_url, model_name):
         """Streaming chat without tools should produce text chunks."""
@@ -269,13 +269,11 @@ class TestToolCallGeneration:
         for tc in tool_calls:
             # This must not raise json.JSONDecodeError
             args = json.loads(tc["function"]["arguments"])
-            assert isinstance(args, dict), (
-                f"Arguments should be a dict, got {type(args)}"
-            )
+            assert isinstance(
+                args, dict
+            ), f"Arguments should be a dict, got {type(args)}"
 
-    def test_tool_selection_from_multiple(
-        self, server_url, model_name, multi_tools
-    ):
+    def test_tool_selection_from_multiple(self, server_url, model_name, multi_tools):
         """Model selects the correct tool from multiple options."""
         result = _chat_completion(
             server_url,
@@ -294,9 +292,9 @@ class TestToolCallGeneration:
             pytest.skip("Model chose text response over tool call")
 
         tc = tool_calls[0]
-        assert tc["function"]["name"] == "search_web", (
-            f"Expected search_web, got {tc['function']['name']}"
-        )
+        assert (
+            tc["function"]["name"] == "search_web"
+        ), f"Expected search_web, got {tc['function']['name']}"
 
     def test_streaming_tool_call(self, server_url, model_name, weather_tools):
         """Streaming mode produces parseable tool calls."""
@@ -395,9 +393,7 @@ class TestNoToolCallWhenUnnecessary:
     """Contract: when tools are defined but the prompt doesn't need them,
     the model responds with text content, not a forced tool call."""
 
-    def test_greeting_with_tools_defined(
-        self, server_url, model_name, weather_tools
-    ):
+    def test_greeting_with_tools_defined(self, server_url, model_name, weather_tools):
         """A greeting should get a text response even with tools available."""
         result = _chat_completion(
             server_url,
@@ -416,9 +412,9 @@ class TestNoToolCallWhenUnnecessary:
         tool_calls = choice["message"].get("tool_calls")
 
         # Should have text content, not a tool call
-        assert len(content.strip()) > 0, (
-            "Greeting produced empty content — grammar may be forcing tool calls"
-        )
+        assert (
+            len(content.strip()) > 0
+        ), "Greeting produced empty content — grammar may be forcing tool calls"
         if tool_calls and len(tool_calls) > 0:
             pytest.fail(
                 "Grammar enforcement forced a tool call on a greeting. "
@@ -443,9 +439,9 @@ class TestNoToolCallWhenUnnecessary:
         )
         choice = result["choices"][0]
         content = choice["message"].get("content", "") or ""
-        assert "Paris" in content or "paris" in content.lower(), (
-            f"Expected 'Paris' in response, got: {content}"
-        )
+        assert (
+            "Paris" in content or "paris" in content.lower()
+        ), f"Expected 'Paris' in response, got: {content}"
 
 
 # ---------------------------------------------------------------------------
@@ -457,9 +453,7 @@ class TestNoToolCallWhenUnnecessary:
 class TestEmptyToolList:
     """Contract: an empty tool list should behave identically to no tools."""
 
-    def test_empty_tools_produces_normal_response(
-        self, server_url, model_name
-    ):
+    def test_empty_tools_produces_normal_response(self, server_url, model_name):
         """Empty tools=[] should not activate grammar enforcement."""
         result = _chat_completion(
             server_url,

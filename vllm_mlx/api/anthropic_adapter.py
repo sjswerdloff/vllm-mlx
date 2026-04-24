@@ -198,16 +198,20 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
             if source.get("type") == "base64":
                 media_type = source.get("media_type", "image/jpeg")
                 data = source.get("data", "")
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{media_type};base64,{data}"},
-                })
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{data}"},
+                    }
+                )
                 has_images = True
             elif source.get("type") == "url":
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": source.get("url", "")},
-                })
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": source.get("url", "")},
+                    }
+                )
                 has_images = True
 
         elif block.type == "tool_use":
@@ -240,10 +244,14 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                         if source.get("type") == "base64":
                             media_type = source.get("media_type", "image/jpeg")
                             data = source.get("data", "")
-                            tool_result_images.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{media_type};base64,{data}"},
-                            })
+                            tool_result_images.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{media_type};base64,{data}"
+                                    },
+                                }
+                            )
                     elif isinstance(item, str):
                         parts.append(item)
                 result_content = "\n".join(parts)
@@ -264,9 +272,7 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                 image_parts = tool_result_images + [
                     {"type": "text", "text": "[Image from tool result]"},
                 ]
-                tool_results.append(
-                    Message(role="user", content=image_parts)
-                )
+                tool_results.append(Message(role="user", content=image_parts))
 
     # Build the messages
     text_parts = [p["text"] for p in content_parts if p["type"] == "text"]

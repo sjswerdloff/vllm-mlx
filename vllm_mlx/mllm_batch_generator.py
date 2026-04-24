@@ -549,12 +549,12 @@ class MLLMBatchGenerator:
             r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
             r"\s*\{%-\s*if\b.*?%\}"  # nested IF
             r".*?"
-            r"\{%-\s*else\s*%\}"     # nested ELSE
+            r"\{%-\s*else\s*%\}"  # nested ELSE
             r".*?"
-            r"\{%-\s*endif\s*%\}"    # nested ENDIF
+            r"\{%-\s*endif\s*%\}"  # nested ENDIF
             r"\s*\{%-\s*else\s*%\}"  # OUTER ELSE
-            r"\s*(\{\{-.*?\}\})"     # plain content (capture)
-            r"\s*\{%-\s*endif\s*%\}" # OUTER ENDIF
+            r"\s*(\{\{-.*?\}\})"  # plain content (capture)
+            r"\s*\{%-\s*endif\s*%\}"  # OUTER ENDIF
         )
         new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
         if new_template != template:
@@ -986,7 +986,9 @@ class MLLMBatchGenerator:
             except Exception:
                 pass  # Fall back to language model's internal computation
 
-        logger.info(f"[chunked_prefill] total={total} step={step} will_chunk={total > step}")
+        logger.info(
+            f"[chunked_prefill] total={total} step={step} will_chunk={total > step}"
+        )
 
         # Short prompt — process in one shot (no chunking overhead)
         if total <= step:
@@ -1103,9 +1105,7 @@ class MLLMBatchGenerator:
             f"[vision_chunked] {total} tokens — encoding vision then chunking LLM"
         )
 
-        embed_output = self.model.get_input_embeddings(
-            input_ids=input_ids, **kwargs
-        )
+        embed_output = self.model.get_input_embeddings(input_ids=input_ids, **kwargs)
         inputs_embeds = embed_output.inputs_embeds
         mx.eval(inputs_embeds)
 
@@ -1392,7 +1392,9 @@ class MLLMBatchGenerator:
                                     if hasattr(c, "keys") and c.keys is not None:
                                         cache_tensors.extend([c.keys, c.values])
                                     elif hasattr(c, "cache"):
-                                        cache_tensors.extend([x for x in c.cache if x is not None])
+                                        cache_tensors.extend(
+                                            [x for x in c.cache if x is not None]
+                                        )
                                 mx.eval(cache_tensors)
                                 processed += step
                                 chunk_count += 1
@@ -1469,9 +1471,17 @@ class MLLMBatchGenerator:
                     with mx.stream(MLLMBatchGenerator._stream):
                         # Text-only: chunked prefill with real progress tracking
                         # Multimodal: atomic VLM forward (vision encoder needs full input)
-                        has_pixels = req.pixel_values is not None and req.pixel_values.size > 0
-                        use_chunked = req.is_text_only or (not has_pixels and req.input_ids is not None and req.input_ids.size > self.prefill_step_size)
-                        logger.info(f"[prefill] req={req.request_id[:8]} is_text_only={req.is_text_only} has_pixels={has_pixels} tokens={req.input_ids.size if req.input_ids is not None else 0} chunked={use_chunked}")
+                        has_pixels = (
+                            req.pixel_values is not None and req.pixel_values.size > 0
+                        )
+                        use_chunked = req.is_text_only or (
+                            not has_pixels
+                            and req.input_ids is not None
+                            and req.input_ids.size > self.prefill_step_size
+                        )
+                        logger.info(
+                            f"[prefill] req={req.request_id[:8]} is_text_only={req.is_text_only} has_pixels={has_pixels} tokens={req.input_ids.size if req.input_ids is not None else 0} chunked={use_chunked}"
+                        )
                         if use_chunked:
                             logits = self._run_chunked_text_prefill(
                                 req, cache=request_cache
@@ -1895,7 +1905,9 @@ class MLLMBatchGenerator:
         """
         if self.prefix_cache is None or not end_indices:
             return
-        logger.info(f"[prefix_cache] Storing caches for {len(end_indices)} finished requests")
+        logger.info(
+            f"[prefix_cache] Storing caches for {len(end_indices)} finished requests"
+        )
         for i in end_indices:
             req = batch.requests[i]
             if req.input_ids is not None:
@@ -1912,7 +1924,9 @@ class MLLMBatchGenerator:
                     prompt_cache = _trim_cache_offset(extracted, total_trim)
                     cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
                     self.prefix_cache.store(cache_key, prompt_cache)
-                    logger.info(f"[prefix_cache] Stored {len(cache_key)} tokens for {req.request_id[:8]}")
+                    logger.info(
+                        f"[prefix_cache] Stored {len(cache_key)} tokens for {req.request_id[:8]}"
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"

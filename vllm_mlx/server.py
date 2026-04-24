@@ -4403,8 +4403,10 @@ async def _stream_anthropic_messages(
     # Extract messages for engine
     if engine.is_mllm:
         # MLLM: keep images inside messages (engine.stream_chat extracts them internally)
-        messages = [m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
-                    for m in openai_request.messages]
+        messages = [
+            m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
+            for m in openai_request.messages
+        ]
     else:
         messages, images, videos = extract_multimodal_content(
             openai_request.messages,
