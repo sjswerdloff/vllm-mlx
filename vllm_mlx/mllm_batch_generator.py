@@ -1302,6 +1302,19 @@ class MLLMBatchGenerator:
                     S = self._think_suffix_len
                     lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
                     cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                    if cached_kv is not None:
+                        logger.info(
+                            f"[prefix_cache] Hit for {req.request_id[:8]}: "
+                            f"cached={len(input_ids_list) - len(remaining_ids)} "
+                            f"remaining={len(remaining_ids)} "
+                            f"is_text_only={req.is_text_only}"
+                        )
+                    else:
+                        logger.info(
+                            f"[prefix_cache] Miss for {req.request_id[:8]}: "
+                            f"tokens={len(input_ids_list)} "
+                            f"is_text_only={req.is_text_only}"
+                        )
                     # Append think suffix back to remaining so the model
                     # sees the full generation prompt (<think>\n).
                     if cached_kv is not None and S > 0:
@@ -1317,6 +1330,10 @@ class MLLMBatchGenerator:
                             None,
                         )
                         if img_tok is not None and img_tok in remaining_ids:
+                            logger.info(
+                                f"[prefix_cache] Image tokens in remaining "
+                                f"({len(remaining_ids)} tokens) — clearing hit"
+                            )
                             cached_kv = None
                             remaining_ids = None
 
