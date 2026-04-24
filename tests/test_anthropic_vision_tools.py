@@ -14,7 +14,6 @@ Author: Clement (clement-7074f29f)
 """
 
 import base64
-import json
 from pathlib import Path
 
 import pytest

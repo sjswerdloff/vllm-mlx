@@ -12,7 +12,6 @@ import json
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
-import pytest
 
 
 # =============================================================================
