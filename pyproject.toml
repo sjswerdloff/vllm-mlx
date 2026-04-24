@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.2.8"
+version = "0.2.9"
 description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -44,16 +44,19 @@ dependencies = [
     # Video processing for VLM
     "opencv-python>=4.8.0",
     # Vision processor (required for transformers AutoProcessor)
-    "torchvision>=0.21.0",
+    "torchvision>=0.23.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
+    "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
     "jsonschema>=4.0.0",
+    # Constrained decoding (grammar-guided generation for response_format)
+    "lm-format-enforcer>=0.10.9",
     # pytz is required by gradio but not declared as a dependency
     # See: https://github.com/waybarrios/vllm-mlx/issues/23
     "pytz>=2024.1",
@@ -65,7 +68,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
+    "anyio>=4.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
@@ -74,8 +77,8 @@ vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.3.0",
-    "torchvision>=0.21.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
@@ -109,11 +112,15 @@ mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
+vllm-mlx-text-chat = "vllm_mlx.gradio_text_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_mlx*"]
+
+[tool.setuptools.package-data]
+"vllm_mlx.bench_serve_prompts" = ["*.json"]
 
 [tool.black]
 line-length = 88
@@ -135,4 +142,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-asyncio_mode = "auto"

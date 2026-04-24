@@ -25,7 +25,8 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
-    r"\[e~\[|\]~b\][a-z]*|\]~!b\["
+    r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
+    r"</?tool_call_reasoning>"
 )
 
 
@@ -382,6 +383,45 @@ def is_mllm_model(model_name: str) -> bool:
 
 # Backwards compatibility alias
 is_vlm_model = is_mllm_model
+
+
+# =============================================================================
+# Media Content Detection
+# =============================================================================
+
+MEDIA_CONTENT_TYPES = frozenset(
+    {
+        "image_url",
+        "video_url",
+        "audio_url",
+        "image",
+        "video",
+        "audio",
+    }
+)
+
+
+def has_media_content(messages: list) -> bool:
+    """Check if any message contains media content (images, video, audio).
+
+    Handles both plain dicts (``msg.get("content")``) and Pydantic-style
+    objects (``msg.content``) so it works in both engine and server contexts.
+    """
+    for msg in messages:
+        content = (
+            msg.get("content")
+            if isinstance(msg, dict)
+            else getattr(msg, "content", None)
+        )
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                else:
+                    part_type = getattr(part, "type", None)
+                if part_type in MEDIA_CONTENT_TYPES:
+                    return True
+    return False
 
 
 # =============================================================================

@@ -64,7 +64,7 @@ def model_name(request):
     return request.config.getoption("--model")
 
 
-@pytest.fixture(params=["asyncio"])
-def anyio_backend(request):
-    """Run anyio-marked tests on asyncio only (trio is not installed)."""
-    return request.param
+@pytest.fixture
+def anyio_backend():
+    """Run anyio-marked tests on asyncio only."""
+    return "asyncio"
