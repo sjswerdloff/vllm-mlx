@@ -1203,6 +1203,19 @@ class MLLMBatchGenerator:
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
 
+            # Progress logging and incremental session cache save every 8 chunks
+            if chunk_count % 8 == 0:
+                pct = processed * 100 // total
+                logger.info(
+                    f"[chunked_prefill] {request.request_id[:8]} "
+                    f"progress: {processed}/{total} tokens ({pct}%)"
+                )
+                if self.session_cache is not None and cache:
+                    partial_cache = self._copy_prefix_cache(cache)
+                    self.session_cache.store(
+                        session_ids_full[:processed], partial_cache, session_key
+                    )
+
             # Release Metal buffer pool periodically.  Full-attention layers
             # produce attention score buffers that grow each chunk (1024 ×
             # growing_context).  Old smaller buffers can't be reused, so the
@@ -1354,6 +1367,19 @@ class MLLMBatchGenerator:
             processed += step
             chunk_count += 1
             self._prefill_progress[request.request_id] = (processed, total)
+
+            # Progress logging and incremental session cache save every 8 chunks
+            if chunk_count % 8 == 0:
+                pct = processed * 100 // total
+                logger.info(
+                    f"[vision_chunked] {request.request_id[:8]} "
+                    f"progress: {processed}/{total} tokens ({pct}%)"
+                )
+                if self.session_cache is not None and cache:
+                    partial_cache = self._copy_prefix_cache(cache)
+                    self.session_cache.store(
+                        session_ids_full[:processed], partial_cache, session_key
+                    )
 
             if chunk_count % 4 == 0:
                 mx.clear_cache()
