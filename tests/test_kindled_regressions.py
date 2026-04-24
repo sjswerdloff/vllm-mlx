@@ -336,3 +336,233 @@ class TestPrefixCacheVisionHistory:
 
         assert cached_kv is not None, "Exact match should hit"
         assert remaining == [], "Exact match should have no remaining tokens"
+
+
+# =============================================================================
+# 5. Vision chunked prefill must check abort between chunks
+#
+# When a client disconnects during a long vision prefill, the GPU continues
+# processing the full 127K token prefill for minutes, blocking all other
+# requests. The vision chunked path must check _aborted_request_ids between
+# LLM chunks (same as the text-only chunked path does).
+#
+# Regression: someone removes the abort check from _run_vision_encoding's
+# chunked LLM loop, or future refactors miss it.
+# =============================================================================
+
+
+class TestVisionPrefillAbortCheck:
+    """Verify vision chunked prefill aborts on client disconnect."""
+
+    def test_vision_chunked_aborts_between_chunks(self):
+        """Vision LLM chunked loop should raise PrefillAbortedError on abort."""
+        import pytest
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            PrefillAbortedError,
+        )
+
+        # Build a minimal generator with mock models
+        mock_model = MagicMock()
+        mock_language_model = MagicMock(return_value=mx.zeros((1, 1, 32)))
+
+        # get_input_embeddings returns an object with .inputs_embeds
+        embed_output = MagicMock()
+        embed_output.inputs_embeds = mx.zeros((1, 12, 32))
+        mock_model.get_input_embeddings = MagicMock(return_value=embed_output)
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.model = mock_model
+        gen.language_model = mock_language_model
+        gen.prefill_step_size = 4  # Force chunking: 12 tokens / 4 = 3 chunks
+        gen._prefill_progress = {}
+        gen._aborted_request_ids = set()
+        gen._vision_feature_cache = None
+
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="test-vision-abort",
+            prompt="test",
+        )
+        request.input_ids = mx.zeros((1, 12), dtype=mx.int32)
+        request.pixel_values = mx.zeros((1, 3, 224, 224))
+        request.attention_mask = None
+        request.image_grid_thw = None
+        request.extra_kwargs = {}
+
+        # Mark request as aborted (simulates client disconnect)
+        gen._aborted_request_ids.add("test-vision-abort")
+
+        # Should abort before even starting ViT encoding
+        with pytest.raises(PrefillAbortedError):
+            gen._run_vision_encoding(request, cache=[])
+
+    def test_vision_chunked_aborts_mid_llm_forward(self):
+        """Vision LLM loop should abort mid-way through chunks."""
+        import pytest
+
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            PrefillAbortedError,
+        )
+
+        mock_model = MagicMock()
+        mock_language_model = MagicMock(return_value=mx.zeros((1, 1, 32)))
+
+        embed_output = MagicMock()
+        embed_output.inputs_embeds = mx.zeros((1, 12, 32))
+        mock_model.get_input_embeddings = MagicMock(return_value=embed_output)
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.model = mock_model
+        gen.language_model = mock_language_model
+        gen.prefill_step_size = 4
+        gen._prefill_progress = {}
+        gen._aborted_request_ids = set()
+        gen._vision_feature_cache = None
+
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="test-vision-mid-abort",
+            prompt="test",
+        )
+        request.input_ids = mx.zeros((1, 12), dtype=mx.int32)
+        request.pixel_values = mx.zeros((1, 3, 224, 224))
+        request.attention_mask = None
+        request.image_grid_thw = None
+        request.extra_kwargs = {}
+
+        # NOT aborted initially — let ViT encoding proceed
+        # Abort after first LLM chunk via side_effect on language_model
+        call_count = [0]
+        original_return = mx.zeros((1, 1, 32))
+
+        def abort_after_first_chunk(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # After first chunk, simulate client disconnect
+                gen._aborted_request_ids.add("test-vision-mid-abort")
+            return original_return
+
+        gen.language_model.side_effect = abort_after_first_chunk
+
+        cache = [TrackingKVCache(), TrackingArraysCache()]
+
+        with pytest.raises(PrefillAbortedError):
+            gen._run_vision_encoding(request, cache=cache)
+
+        # Verify it processed at least one chunk before aborting
+        assert call_count[0] >= 1, "Should have processed at least one chunk"
+
+
+# =============================================================================
+# 6. Vision feature cache passes through to get_input_embeddings
+#
+# When the vision feature cache is enabled and the request has images,
+# _run_vision_encoding must pass vision_cache and _image_key as kwargs
+# to model.get_input_embeddings so the model can skip ViT re-encoding
+# for images it has already processed.
+#
+# Regression: someone removes the kwargs injection or changes the kwarg
+# names, breaking the cache integration with mlx-vlm models.
+# =============================================================================
+
+
+class TestVisionFeatureCacheIntegration:
+    """Verify vision feature cache kwargs are passed to get_input_embeddings."""
+
+    def test_feature_cache_kwargs_passed_to_model(self):
+        """get_input_embeddings should receive vision_cache and _image_key."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        mock_model = MagicMock()
+        mock_language_model = MagicMock(return_value=mx.zeros((1, 1, 32)))
+
+        embed_output = MagicMock()
+        embed_output.inputs_embeds = mx.zeros((1, 12, 32))
+        mock_model.get_input_embeddings = MagicMock(return_value=embed_output)
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.model = mock_model
+        gen.language_model = mock_language_model
+        gen.prefill_step_size = 4
+        gen._prefill_progress = {}
+        gen._aborted_request_ids = set()
+
+        # Create a mock vision feature cache
+        mock_feature_cache = MagicMock()
+        mock_feature_cache.get.return_value = None  # Cache miss
+        mock_feature_cache.__len__ = MagicMock(return_value=0)
+        gen._vision_feature_cache = mock_feature_cache
+
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="test-feature-cache",
+            prompt="test",
+            images=["image1.jpg", "image2.jpg"],
+        )
+        request.input_ids = mx.zeros((1, 12), dtype=mx.int32)
+        request.pixel_values = mx.zeros((1, 3, 224, 224))
+        request.attention_mask = None
+        request.image_grid_thw = None
+        request.extra_kwargs = {}
+
+        cache = [TrackingKVCache(), TrackingArraysCache()]
+        gen._run_vision_encoding(request, cache=cache)
+
+        # Verify get_input_embeddings was called with vision cache kwargs
+        call_kwargs = mock_model.get_input_embeddings.call_args[1]
+        assert "vision_cache" in call_kwargs, (
+            "vision_cache kwarg must be passed to get_input_embeddings "
+            "so the model can skip ViT re-encoding on cache hit"
+        )
+        assert "_image_key" in call_kwargs, (
+            "_image_key kwarg must be passed to get_input_embeddings "
+            "for cache key lookup"
+        )
+        assert call_kwargs["vision_cache"] is mock_feature_cache
+
+    def test_feature_cache_not_injected_without_images(self):
+        """Requests without images should not inject vision cache kwargs."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+        mock_model = MagicMock()
+        mock_language_model = MagicMock(return_value=mx.zeros((1, 1, 32)))
+
+        embed_output = MagicMock()
+        embed_output.inputs_embeds = mx.zeros((1, 12, 32))
+        mock_model.get_input_embeddings = MagicMock(return_value=embed_output)
+
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen.model = mock_model
+        gen.language_model = mock_language_model
+        gen.prefill_step_size = 4
+        gen._prefill_progress = {}
+        gen._aborted_request_ids = set()
+
+        mock_feature_cache = MagicMock()
+        gen._vision_feature_cache = mock_feature_cache
+
+        # Request WITHOUT images
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="test-no-images",
+            prompt="test",
+        )
+        request.input_ids = mx.zeros((1, 12), dtype=mx.int32)
+        request.pixel_values = None
+        request.attention_mask = None
+        request.image_grid_thw = None
+        request.extra_kwargs = {}
+
+        cache = [TrackingKVCache(), TrackingArraysCache()]
+        gen._run_vision_encoding(request, cache=cache)
+
+        # vision_cache should NOT be in kwargs when no images
+        call_kwargs = mock_model.get_input_embeddings.call_args[1]
+        assert (
+            "vision_cache" not in call_kwargs
+        ), "vision_cache should not be injected for requests without images"

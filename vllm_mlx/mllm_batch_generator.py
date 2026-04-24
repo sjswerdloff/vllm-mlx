@@ -27,7 +27,7 @@ import mlx.nn as nn
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
 from .multimodal_processor import MultimodalProcessor
-from .vision_embedding_cache import VisionEmbeddingCache
+from .vision_embedding_cache import VisionEmbeddingCache, compute_images_hash
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +450,30 @@ class MLLMBatchGenerator:
             max_encoding_entries=vision_cache_size // 2,
             enabled=enable_vision_cache,
         )
+
+        # Vision feature cache: caches ViT encoder output (prompt-independent)
+        # Saves ~10-30s per image on repeated vision requests by skipping the
+        # vision_tower forward pass entirely.  Uses mlx-vlm's VisionFeatureCache
+        # which the qwen3_5 model's get_input_embeddings already supports via
+        # the vision_cache/cached_image_features kwargs.
+        self._vision_feature_cache = None
+        if enable_vision_cache:
+            try:
+                from mlx_vlm.vision_cache import VisionFeatureCache
+
+                self._vision_feature_cache = VisionFeatureCache(
+                    max_size=vision_cache_size
+                )
+                logger.info(
+                    f"MLLMBatchGenerator: Vision feature cache enabled "
+                    f"(size={vision_cache_size})"
+                )
+            except ImportError:
+                logger.debug(
+                    "mlx_vlm.vision_cache not available, "
+                    "vision feature caching disabled"
+                )
+
         if enable_vision_cache:
             logger.info(
                 f"MLLMBatchGenerator: Vision cache enabled (size={vision_cache_size})"
@@ -1090,6 +1114,13 @@ class MLLMBatchGenerator:
         total = input_ids.shape[1]
         step = self.prefill_step_size
 
+        # Inject vision feature cache so the model can skip ViT re-encoding
+        # for images it has already processed. The model's get_input_embeddings
+        # checks for vision_cache/_image_key kwargs (mlx-vlm convention).
+        if self._vision_feature_cache is not None and request.images:
+            kwargs["vision_cache"] = self._vision_feature_cache
+            kwargs["_image_key"] = compute_images_hash(request.images)
+
         # For short prompts, run the full VLM forward in one shot (original path)
         if total <= step:
             output = self.model(input_ids, cache=cache, **kwargs)
@@ -1101,8 +1132,28 @@ class MLLMBatchGenerator:
         # Long prompt with vision: separate ViT encoding from LLM forward.
         # 1) Run get_input_embeddings to encode images + merge into embeddings
         # 2) Chunk the LLM forward on the merged embeddings
+
+        # Check for abort before expensive ViT encoding
+        if request.request_id in self._aborted_request_ids:
+            self._aborted_request_ids.discard(request.request_id)
+            logger.info(
+                f"[vision_chunked] Aborted {request.request_id} before "
+                f"vision encoding ({total} tokens)"
+            )
+            raise PrefillAbortedError(request.request_id)
+
+        image_key = kwargs.get("_image_key")
+        cache_status = "disabled"
+        if self._vision_feature_cache is not None and image_key:
+            cache_status = (
+                "hit"
+                if self._vision_feature_cache.get(image_key) is not None
+                else "miss"
+            )
+
         logger.info(
-            f"[vision_chunked] {total} tokens — encoding vision then chunking LLM"
+            f"[vision_chunked] {total} tokens — encoding vision then chunking LLM "
+            f"(feature_cache={cache_status})"
         )
 
         embed_output = self.model.get_input_embeddings(input_ids=input_ids, **kwargs)
@@ -1113,6 +1164,15 @@ class MLLMBatchGenerator:
         processed = 0
         chunk_count = 0
         while processed + step < total:
+            # Check for abort between chunks (client disconnect)
+            if request.request_id in self._aborted_request_ids:
+                self._aborted_request_ids.discard(request.request_id)
+                logger.info(
+                    f"[vision_chunked] Aborted {request.request_id} at "
+                    f"{processed}/{total} tokens"
+                )
+                raise PrefillAbortedError(request.request_id)
+
             chunk_embeds = inputs_embeds[:, processed : processed + step, :]
             self.language_model(
                 input_ids[:, processed : processed + step],
@@ -1938,7 +1998,10 @@ class MLLMBatchGenerator:
 
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
-        return self.vision_cache.get_stats()
+        stats = self.vision_cache.get_stats()
+        if self._vision_feature_cache is not None:
+            stats["vision_feature_cache_entries"] = len(self._vision_feature_cache)
+        return stats
 
     def get_prefix_cache_stats(self) -> Dict[str, Any]:
         """Get KV prefix cache statistics."""
