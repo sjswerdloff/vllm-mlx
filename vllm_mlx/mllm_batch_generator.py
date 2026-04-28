@@ -369,6 +369,9 @@ class MLLMBatchRequest:
     # Text-only flag (no images/videos — eligible for prefix cache)
     is_text_only: bool = False
 
+    # Actual prompt token count (set after preprocessing from input_ids.size)
+    num_prompt_tokens: int = 0
+
     # Generation state
     num_tokens: int = 0  # Tokens generated so far
     output_tokens: List[int] = field(default_factory=list)
@@ -393,6 +396,9 @@ class MLLMBatchResponse:
     logprobs: mx.array  # Log probabilities
     finish_reason: Optional[str] = None  # "stop", "length", or None
     prompt_cache: Optional[Callable[[], List[Any]]] = None  # Cache extraction function
+    prompt_tokens: int = (
+        0  # Actual prompt token count (from input_ids after preprocessing)
+    )
 
 
 @dataclass
@@ -1156,6 +1162,10 @@ class MLLMBatchGenerator:
 
         self._stats.num_images_processed += len(all_images)
         self._stats.vision_encoding_time += processing_time
+
+        # Track actual prompt token count (after template + image tokens)
+        if request.input_ids is not None:
+            request.num_prompt_tokens = request.input_ids.size
 
         # Mark text-only requests (eligible for prefix cache)
         request.is_text_only = not bool(all_images)
@@ -2355,6 +2365,7 @@ class MLLMBatchGenerator:
                     logprobs=logprobs[i],
                     finish_reason=finish_reason,
                     prompt_cache=cache_fn,
+                    prompt_tokens=req.num_prompt_tokens,
                 )
             )
 

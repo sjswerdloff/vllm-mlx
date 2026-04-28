@@ -605,6 +605,11 @@ class MLLMScheduler:
                 detok.add_token(response.token)
                 new_text = detok.last_segment
 
+            # Update prompt token count from batch generator (which knows
+            # the actual count after template + image token processing).
+            if response.prompt_tokens > 0:
+                request.num_prompt_tokens = response.prompt_tokens
+
             # Create output
             output = RequestOutput(
                 request_id=request_id,
