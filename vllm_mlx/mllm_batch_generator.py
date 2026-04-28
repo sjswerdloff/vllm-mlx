@@ -2773,6 +2773,9 @@ def install_mtp_mllm(
                 draft_t = draft_info["token"]
                 draft_lp = draft_info["logprobs"]
 
+                # prompt_tokens intentionally omitted (0) for draft token responses.
+                # The scheduler's `response.prompt_tokens > 0` guard prevents these
+                # from resetting the actual count set by the main _next path.
                 if draft_t in batch_gen.stop_tokens:
                     augmented.append(
                         MLLMBatchResponse(
