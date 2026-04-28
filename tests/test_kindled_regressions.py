@@ -741,3 +741,111 @@ class TestVisionFeatureCacheIntegration:
         assert (
             "vision_cache" not in call_kwargs
         ), "vision_cache should not be injected for requests without images"
+
+
+# =============================================================================
+# 8. Anthropic streaming token counts: prompt token propagation
+#
+# The Anthropic streaming endpoint reports `input_tokens` in the
+# `message_delta` event.  For that to be correct, the actual prompt token
+# count (after template expansion and image token insertion) must flow from
+# _preprocess_request → MLLMBatchRequest.num_prompt_tokens
+#                     → MLLMBatchResponse.prompt_tokens
+#                     → scheduler request.num_prompt_tokens
+#
+# Regression: someone removes num_prompt_tokens from MLLMBatchRequest, or
+# drops prompt_tokens from MLLMBatchResponse, or removes the scheduler guard
+# `if response.prompt_tokens > 0`.  Any of these silently sends 0 input_tokens
+# to Anthropic clients.
+# =============================================================================
+
+
+class TestPromptTokenCountPropagation:
+    """Verify prompt token count flows from preprocessing through to response."""
+
+    def test_preprocess_request_sets_num_prompt_tokens(self):
+        """_preprocess_request must set num_prompt_tokens = input_ids.size."""
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+            MLLMBatchStats,
+        )
+
+        # Build a minimal generator via __new__ (avoids __init__ side-effects)
+        gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._vision_feature_cache = None
+        gen._think_suffix_len = 0
+        gen.session_cache = None
+        gen._prefill_progress = {}
+        gen._aborted_request_ids = set()
+        gen.prefill_step_size = 512
+        gen.vision_cache = MagicMock()
+        gen.processor = MagicMock()
+        gen.model = MagicMock()
+        gen.model.config = MagicMock()
+        gen.is_vlm = True
+        gen._stats = MLLMBatchStats()
+        gen.language_model = MagicMock()
+
+        # Vision cache: force cache miss so prepare_inputs is called
+        gen.vision_cache.get_pixel_cache.return_value = None
+
+        # prepare_inputs returns a dict with input_ids of known size (20 tokens)
+        fake_input_ids = mx.zeros((1, 20), dtype=mx.int32)
+        fake_inputs = {
+            "input_ids": fake_input_ids,
+            "pixel_values": None,
+            "attention_mask": None,
+        }
+
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="test-prompt-tokens",
+            prompt="Hello world",
+        )
+
+        with patch(
+            "mlx_vlm.utils.prepare_inputs",
+            return_value=fake_inputs,
+        ):
+            gen._preprocess_request(request)
+
+        assert request.num_prompt_tokens == fake_input_ids.size, (
+            f"num_prompt_tokens should equal input_ids.size ({fake_input_ids.size}), "
+            f"got {request.num_prompt_tokens}. "
+            "If this fails, Anthropic streaming will report 0 input_tokens."
+        )
+
+    def test_mllm_batch_response_carries_prompt_tokens(self):
+        """MLLMBatchResponse must be constructible with prompt_tokens and expose it."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+        response = MLLMBatchResponse(
+            uid=1,
+            request_id="test-resp",
+            token=42,
+            logprobs=mx.zeros((1,)),
+            prompt_tokens=12345,
+        )
+
+        assert response.prompt_tokens == 12345, (
+            f"MLLMBatchResponse.prompt_tokens should be 12345, got {response.prompt_tokens}. "
+            "This field carries the actual prompt token count to the scheduler."
+        )
+
+    def test_mllm_batch_response_prompt_tokens_defaults_to_zero(self):
+        """MLLMBatchResponse.prompt_tokens defaults to 0 (e.g. for MTP draft responses)."""
+        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+
+        response = MLLMBatchResponse(
+            uid=2,
+            request_id="test-default",
+            token=7,
+            logprobs=mx.zeros((1,)),
+        )
+
+        assert response.prompt_tokens == 0, (
+            f"Default prompt_tokens should be 0, got {response.prompt_tokens}. "
+            "The scheduler's `response.prompt_tokens > 0` guard relies on this "
+            "default to avoid overwriting the real count with MTP draft responses."
+        )

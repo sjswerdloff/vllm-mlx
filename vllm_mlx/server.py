@@ -4652,11 +4652,18 @@ async def _stream_anthropic_messages(
         # Determine stop reason
         stop_reason = "tool_use" if tool_calls else "end_turn"
 
-        # Emit message_delta with stop_reason and usage
+        # Emit message_delta with stop_reason and usage.
+        # Include input_tokens here because message_start emits before we
+        # know the prompt token count (the engine reports it mid-stream).
+        # Claude Code reads input_tokens from message_delta to track
+        # cumulative context usage.
         message_delta = {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": completion_tokens},
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+            },
         }
         yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
