@@ -15,7 +15,8 @@ Example:
     config = MemoryCacheConfig(max_memory_percent=0.25)
     cache = MemoryAwarePrefixCache(model, config)
 
-    # Fetch returns reference (no copy) - safe because MLX arrays are immutable
+    # Fetch returns reference (no copy) — caller MUST copy before mutating
+    # (e.g. via _copy_prefix_cache) since cache objects have mutable state.
     kv_cache, remaining = cache.fetch(tokens)
 
     # Store tracks memory automatically
@@ -556,6 +557,7 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     ``update_and_fetch`` mutations don't corrupt the stored cache entry.
     """
     import mlx.core as mx
+    from mlx_lm.models.cache import ArraysCache, CacheList
 
     result = []
     for layer in cache:
@@ -599,6 +601,18 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
                 if hasattr(layer, attr):
                     setattr(kv, attr, getattr(layer, attr))
             result.append(kv)
+        elif isinstance(layer, ArraysCache):
+            # ArraysCache stores RNN state in a mutable .cache list.
+            # Must copy the list to prevent mutation of stored entries.
+            new_c = ArraysCache(len(layer.cache))
+            new_c.cache = list(layer.cache)
+            if hasattr(layer, "left_padding"):
+                new_c.left_padding = layer.left_padding
+            result.append(new_c)
+        elif isinstance(layer, CacheList):
+            # CacheList wraps sub-caches — recurse
+            copied_subs = _dequantize_cache(list(layer.caches))
+            result.append(CacheList(*copied_subs))
         else:
             result.append(layer)
     return result
@@ -711,8 +725,9 @@ class MemoryAwarePrefixCache:
         matches, and longest-common-prefix (LCP) matches.  Uses a sorted key
         index for O(log N) lookup instead of scanning all entries.
 
-        Returns the cached KV state directly (no copy) since MLX arrays
-        are immutable and safe to share.
+        Returns the cached KV state by reference (no copy).  Callers MUST
+        copy before mutating (e.g. via _copy_prefix_cache) — cache objects
+        like ArraysCache have mutable Python state (.cache list).
 
         Args:
             tokens: Input token sequence.
@@ -929,9 +944,11 @@ class MemoryAwarePrefixCache:
         """
         Store KV cache for future reuse.
 
-        This method stores the cache reference directly (no copy) and
-        tracks memory usage. If memory limit is exceeded, LRU entries
-        are evicted until there's room.
+        This method stores the cache by reference (no internal copy).
+        Callers MUST provide an independent cache (e.g. from
+        _copy_prefix_cache or batch.extract_cache) — storing a live
+        cache that generation will mutate causes progressive corruption.
+        Tracks memory usage; evicts LRU entries when limit exceeded.
 
         Args:
             tokens: Token sequence that was processed.
