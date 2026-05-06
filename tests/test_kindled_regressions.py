@@ -628,6 +628,147 @@ class TestSessionKVCache:
         assert kv_t is not None, "Text session should hit"
         assert key_t == text_key
 
+    def test_periodic_persist_respects_interval(self):
+        """Verify _maybe_persist only triggers after save_interval elapses."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4, save_interval=1000.0)
+        cache._cache_dir = "/tmp/test_session_persist_interval"
+        cache._last_save_time = 0.0
+
+        # With a 1000s interval, _maybe_persist should NOT trigger immediately
+        # because time.monotonic() - 0 < 1000 in most test runs.
+        # (Unless the test machine has been up 1000s+ since boot, which is
+        # fine — _saving flag would guard the second call.)
+        import time
+
+        cache._last_save_time = time.monotonic()  # "just saved"
+        cache._maybe_persist()
+        assert not cache._saving, "Should not save within interval"
+
+    def test_periodic_persist_triggers_after_interval(self):
+        """Verify _maybe_persist triggers when interval has elapsed."""
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4, save_interval=0.0)
+        cache._cache_dir = "/tmp/test_session_persist_trigger"
+        cache._last_save_time = 0.0
+
+        # Store a session so there's something to save
+        tokens = list(range(100))
+        cache.store(tokens, [TrackingKVCache()], session_key="test:text")
+
+        # With save_interval=0.0, _maybe_persist should trigger
+        # (it was called inside store() above)
+        # Give the background thread a moment to start
+        import time
+
+        time.sleep(0.1)
+        # _saving may be True (thread running) or False (thread finished)
+        # Either way, _last_save_time should have been updated
+        assert cache._last_save_time > 0.0, "Save time should be updated"
+
+    def test_save_load_roundtrip_with_atomic_index(self, tmp_path):
+        """Verify save/load roundtrip with atomic index writes."""
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache = SessionKVCache(max_sessions=4)
+        tokens = list(range(100))
+        # Use a real KVCache so save_prompt_cache can serialize it
+        kv = KVCache()
+        kv.update_and_fetch(mx.ones((1, 4, 10, 8)), mx.ones((1, 4, 10, 8)))
+        cache.store(tokens, [kv], session_key="test:text")
+
+        cache_dir = str(tmp_path / "session_cache")
+        saved = cache.save_to_disk(cache_dir)
+        assert saved, "Should save at least one session"
+        assert cache._cache_dir == cache_dir, "save_to_disk should store cache_dir"
+
+        # Verify no .tmp file remains
+        import os
+
+        assert not os.path.exists(
+            os.path.join(cache_dir, "session_index.json.tmp")
+        ), "Temp index should be renamed away"
+
+        # Load into a fresh cache
+        cache2 = SessionKVCache(max_sessions=4)
+        loaded = cache2.load_from_disk(cache_dir)
+        assert loaded == 1, f"Should load 1 session, got {loaded}"
+        assert cache2._cache_dir == cache_dir, "load_from_disk should store cache_dir"
+
+    def test_broken_index_cleaned_on_failed_load(self, tmp_path):
+        """Verify broken index is removed when no sessions can be loaded."""
+        import json
+        import os
+
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache_dir = str(tmp_path / "broken_cache")
+        os.makedirs(cache_dir)
+
+        # Write an index referencing files that don't exist
+        index = {
+            "version": 1,
+            "num_sessions": 2,
+            "sessions": [
+                {"index": 0, "session_key": "a:text", "num_tokens": 100},
+                {"index": 1, "session_key": "b:text", "num_tokens": 200},
+            ],
+        }
+        index_path = os.path.join(cache_dir, "session_index.json")
+        with open(index_path, "w") as f:
+            json.dump(index, f)
+
+        cache = SessionKVCache(max_sessions=4)
+        loaded = cache.load_from_disk(cache_dir)
+        assert loaded == 0, "No sessions should load (files missing)"
+        assert not os.path.exists(
+            index_path
+        ), "Broken index should be removed so next restart gets clean state"
+
+    def test_stale_files_cleaned_on_save(self, tmp_path):
+        """Verify stale session files from previous saves are cleaned up."""
+        import os
+
+        from mlx_lm.models.cache import KVCache
+
+        from vllm_mlx.mllm_batch_generator import SessionKVCache
+
+        cache_dir = str(tmp_path / "stale_cleanup")
+        os.makedirs(cache_dir)
+
+        # Create stale files that would be left from a previous save with
+        # more sessions
+        for i in range(3):
+            with open(os.path.join(cache_dir, f"session_{i}.safetensors"), "w") as f:
+                f.write("stale")
+            with open(os.path.join(cache_dir, f"session_{i}_tokens.bin"), "w") as f:
+                f.write("stale")
+
+        # Save with only 1 session — sessions 1 and 2 should be cleaned
+        cache = SessionKVCache(max_sessions=4)
+        tokens = list(range(100))
+        kv = KVCache()
+        kv.update_and_fetch(mx.ones((1, 4, 10, 8)), mx.ones((1, 4, 10, 8)))
+        cache.store(tokens, [kv], session_key="only:text")
+        cache.save_to_disk(cache_dir)
+
+        # Session 0 should exist (overwritten by new save)
+        assert os.path.exists(os.path.join(cache_dir, "session_0.safetensors"))
+        # Sessions 1 and 2 should be cleaned up
+        assert not os.path.exists(
+            os.path.join(cache_dir, "session_1.safetensors")
+        ), "Stale session_1 should be removed"
+        assert not os.path.exists(
+            os.path.join(cache_dir, "session_2.safetensors")
+        ), "Stale session_2 should be removed"
+        assert not os.path.exists(
+            os.path.join(cache_dir, "session_2_tokens.bin")
+        ), "Stale tokens file should be removed"
+
 
 # =============================================================================
 # 7. Vision feature cache passes through to get_input_embeddings

@@ -91,11 +91,16 @@ class SessionKVCache:
     KV caches in RAM, evicting LRU when full.
     """
 
-    def __init__(self, max_sessions: int = 4):
+    def __init__(self, max_sessions: int = 4, save_interval: float = 300.0):
         self.max_sessions = max_sessions
         # OrderedDict for LRU: {session_key: (token_ids, kv_cache)}
         self._sessions: "OrderedDict[str, tuple[list[int], list[Any]]]" = OrderedDict()
         self._stats = {"hits": 0, "misses": 0, "stores": 0}
+        # Periodic persistence state
+        self._cache_dir: str | None = None
+        self._last_save_time: float = 0.0
+        self._save_interval: float = save_interval
+        self._saving: bool = False
 
     def fetch(
         self, token_ids: list[int], min_prefix: int = 64
@@ -187,6 +192,7 @@ class SessionKVCache:
             f"[session_cache] Stored {len(token_ids)} tokens, "
             f"session={session_key}, active={len(self._sessions)}"
         )
+        self._maybe_persist()
         return session_key
 
     def get_stats(self) -> dict:
@@ -212,65 +218,15 @@ class SessionKVCache:
 
         Returns True if at least one entry was saved.
         """
-        import array as _array
-        import json
-        import os
-        import time as _time
-
+        self._cache_dir = cache_dir
         if not self._sessions:
             logger.info("[session_persist] nothing to save (0 sessions)")
             return False
-
-        try:
-            from mlx_lm.models.cache import save_prompt_cache
-        except ImportError:
-            logger.warning("[session_persist] mlx_lm not available, cannot save")
-            return False
-
-        t0 = _time.monotonic()
-        os.makedirs(cache_dir, exist_ok=True)
-
-        index = {"version": 1, "num_sessions": len(self._sessions), "sessions": []}
-        saved = 0
-
-        for i, (key, (token_ids, kv_cache)) in enumerate(self._sessions.items()):
-            entry_path = os.path.join(cache_dir, f"session_{i}.safetensors")
-            tokens_path = os.path.join(cache_dir, f"session_{i}_tokens.bin")
-            try:
-                save_prompt_cache(
-                    entry_path,
-                    kv_cache,
-                    metadata={"num_tokens": str(len(token_ids))},
-                )
-                arr = _array.array("i", token_ids)
-                with open(tokens_path, "wb") as f:
-                    arr.tofile(f)
-
-                index["sessions"].append(
-                    {
-                        "index": i,
-                        "session_key": key,
-                        "num_tokens": len(token_ids),
-                    }
-                )
-                saved += 1
-                logger.info(
-                    f"[session_persist] saved session {i}: "
-                    f"{len(token_ids)} tokens, key={key}"
-                )
-            except Exception as e:
-                logger.warning(f"[session_persist] failed to save session {i}: {e}")
-
-        index_path = os.path.join(cache_dir, "session_index.json")
-        with open(index_path, "w") as f:
-            json.dump(index, f, indent=2)
-
-        dt = _time.monotonic() - t0
-        logger.info(
-            f"[session_persist] SAVED {saved}/{len(self._sessions)} sessions "
-            f"to {cache_dir} in {dt:.1f}s"
-        )
-        return saved > 0
+        snapshot = [
+            (key, (list(token_ids), kv_cache))
+            for key, (token_ids, kv_cache) in self._sessions.items()
+        ]
+        return self._save_snapshot(cache_dir, snapshot)
 
     def load_from_disk(self, cache_dir: str) -> int:
         """Load session entries from disk. Returns number loaded."""
@@ -278,6 +234,8 @@ class SessionKVCache:
         import json
         import os
         import time as _time
+
+        self._cache_dir = cache_dir
 
         index_path = os.path.join(cache_dir, "session_index.json")
         if not os.path.exists(index_path):
@@ -330,7 +288,150 @@ class SessionKVCache:
         logger.info(
             f"[session_persist] LOADED {loaded} sessions from {cache_dir} in {dt:.1f}s"
         )
+
+        # If index existed but no sessions loaded, the persisted state is
+        # broken (files deleted, corrupted, etc.).  Remove the stale index
+        # so the next restart gets a clean state instead of repeating the
+        # same failed load.
+        if loaded == 0:
+            try:
+                os.remove(index_path)
+                logger.info(
+                    "[session_persist] removed broken index (0 sessions loaded)"
+                )
+            except OSError:
+                pass
+
         return loaded
+
+    # -- Periodic persistence -------------------------------------------------
+
+    def _maybe_persist(self) -> None:
+        """Save session cache to disk if enough time has elapsed since last save.
+
+        Runs the actual I/O in a background thread so inference is not blocked.
+        """
+        if self._cache_dir is None or self._saving:
+            return
+        import time as _time
+
+        now = _time.monotonic()
+        if now - self._last_save_time < self._save_interval:
+            return
+        self._last_save_time = now
+        self._saving = True
+        # Snapshot session data — list() copies the iteration order,
+        # kv_cache references are shared (MLX arrays are immutable).
+        snapshot = [
+            (key, (list(token_ids), kv_cache))
+            for key, (token_ids, kv_cache) in self._sessions.items()
+        ]
+        import threading
+
+        t = threading.Thread(
+            target=self._persist_background,
+            args=(self._cache_dir, snapshot),
+            daemon=True,
+        )
+        t.start()
+
+    def _persist_background(self, cache_dir: str, snapshot: list) -> None:
+        """Background thread wrapper for periodic saves."""
+        try:
+            self._save_snapshot(cache_dir, snapshot)
+        except Exception as e:
+            logger.warning(f"[session_persist] periodic save failed: {e}")
+        finally:
+            self._saving = False
+
+    def _save_snapshot(self, cache_dir: str, snapshot: list) -> bool:
+        """Save a snapshot of session data to disk.
+
+        Used by both ``save_to_disk`` (synchronous shutdown) and
+        ``_persist_background`` (periodic background save).
+
+        Writes session files first, then atomically replaces the index,
+        then cleans up stale files from previous saves.
+        """
+        import array as _array
+        import glob
+        import json
+        import os
+        import re
+        import time as _time
+
+        try:
+            from mlx_lm.models.cache import save_prompt_cache
+        except ImportError:
+            logger.warning("[session_persist] mlx_lm not available, cannot save")
+            return False
+
+        t0 = _time.monotonic()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        index = {"version": 1, "num_sessions": len(snapshot), "sessions": []}
+        saved = 0
+        saved_indices: set[int] = set()
+
+        for i, (key, (token_ids, kv_cache)) in enumerate(snapshot):
+            entry_path = os.path.join(cache_dir, f"session_{i}.safetensors")
+            tokens_path = os.path.join(cache_dir, f"session_{i}_tokens.bin")
+            try:
+                save_prompt_cache(
+                    entry_path,
+                    kv_cache,
+                    metadata={"num_tokens": str(len(token_ids))},
+                )
+                arr = _array.array("i", token_ids)
+                with open(tokens_path, "wb") as f:
+                    arr.tofile(f)
+
+                index["sessions"].append(
+                    {
+                        "index": i,
+                        "session_key": key,
+                        "num_tokens": len(token_ids),
+                    }
+                )
+                saved += 1
+                saved_indices.add(i)
+                logger.info(
+                    f"[session_persist] saved session {i}: "
+                    f"{len(token_ids)} tokens, key={key}"
+                )
+            except Exception as e:
+                logger.warning(f"[session_persist] failed to save session {i}: {e}")
+
+        # Atomic index write: write to temp file then rename so a crash
+        # mid-write never leaves a partial index on disk.
+        index_path = os.path.join(cache_dir, "session_index.json")
+        tmp_index_path = index_path + ".tmp"
+        with open(tmp_index_path, "w") as f:
+            json.dump(index, f, indent=2)
+        os.replace(tmp_index_path, index_path)
+
+        # Clean up stale session files from previous saves that are no
+        # longer referenced by the current index.
+        for path in glob.glob(os.path.join(cache_dir, "session_*.safetensors")):
+            match = re.search(r"session_(\d+)\.safetensors$", path)
+            if match and int(match.group(1)) not in saved_indices:
+                try:
+                    os.remove(path)
+                    tokens_path = path.replace(".safetensors", "_tokens.bin")
+                    if os.path.exists(tokens_path):
+                        os.remove(tokens_path)
+                    logger.debug(
+                        f"[session_persist] cleaned stale {os.path.basename(path)}"
+                    )
+                except OSError:
+                    pass
+
+        dt = _time.monotonic() - t0
+        logger.info(
+            f"[session_persist] SAVED {saved}/{len(snapshot)} sessions "
+            f"to {cache_dir} in {dt:.1f}s"
+        )
+        return saved > 0
 
 
 @dataclass
