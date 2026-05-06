@@ -630,43 +630,40 @@ class TestSessionKVCache:
 
     def test_periodic_persist_respects_interval(self):
         """Verify _maybe_persist only triggers after save_interval elapses."""
+        from unittest.mock import patch
+
         from vllm_mlx.mllm_batch_generator import SessionKVCache
 
         cache = SessionKVCache(max_sessions=4, save_interval=1000.0)
         cache._cache_dir = "/tmp/test_session_persist_interval"
-        cache._last_save_time = 0.0
 
-        # With a 1000s interval, _maybe_persist should NOT trigger immediately
-        # because time.monotonic() - 0 < 1000 in most test runs.
-        # (Unless the test machine has been up 1000s+ since boot, which is
-        # fine — _saving flag would guard the second call.)
-        import time
+        # _last_save_time is initialized to time.monotonic() in __init__,
+        # and save_interval is 1000s, so _maybe_persist should not trigger.
+        with patch.object(cache, "_save_snapshot") as mock_save:
+            cache._maybe_persist()
+            mock_save.assert_not_called()
 
-        cache._last_save_time = time.monotonic()  # "just saved"
-        cache._maybe_persist()
-        assert not cache._saving, "Should not save within interval"
-
-    def test_periodic_persist_triggers_after_interval(self):
+    def test_periodic_persist_triggers_after_interval(self, tmp_path):
         """Verify _maybe_persist triggers when interval has elapsed."""
         from vllm_mlx.mllm_batch_generator import SessionKVCache
 
         cache = SessionKVCache(max_sessions=4, save_interval=0.0)
-        cache._cache_dir = "/tmp/test_session_persist_trigger"
+        cache._cache_dir = str(tmp_path / "persist_trigger")
+        # Force _last_save_time to the past so interval check passes
         cache._last_save_time = 0.0
 
         # Store a session so there's something to save
         tokens = list(range(100))
-        cache.store(tokens, [TrackingKVCache()], session_key="test:text")
+        kv = TrackingKVCache()
+        cache.store(tokens, [kv], session_key="test:text")
 
-        # With save_interval=0.0, _maybe_persist should trigger
-        # (it was called inside store() above)
-        # Give the background thread a moment to start
         import time
 
-        time.sleep(0.1)
-        # _saving may be True (thread running) or False (thread finished)
-        # Either way, _last_save_time should have been updated
-        assert cache._last_save_time > 0.0, "Save time should be updated"
+        initial_save_time = cache._last_save_time
+        # _maybe_persist is synchronous now, so it saves immediately
+        # if interval has elapsed (save_interval=0, _last_save_time=0)
+        cache._maybe_persist()
+        assert cache._last_save_time > initial_save_time, "Save time should be updated"
 
     def test_save_load_roundtrip_with_atomic_index(self, tmp_path):
         """Verify save/load roundtrip with atomic index writes."""

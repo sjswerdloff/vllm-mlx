@@ -92,15 +92,18 @@ class SessionKVCache:
     """
 
     def __init__(self, max_sessions: int = 4, save_interval: float = 300.0):
+        import time as _time
+
         self.max_sessions = max_sessions
         # OrderedDict for LRU: {session_key: (token_ids, kv_cache)}
         self._sessions: "OrderedDict[str, tuple[list[int], list[Any]]]" = OrderedDict()
         self._stats = {"hits": 0, "misses": 0, "stores": 0}
         # Periodic persistence state
         self._cache_dir: str | None = None
-        self._last_save_time: float = 0.0
+        # Start the clock from now so the first save isn't immediate —
+        # triggering during initial prefill causes Metal threading crashes.
+        self._last_save_time: float = _time.monotonic()
         self._save_interval: float = save_interval
-        self._saving: bool = False
 
     def fetch(
         self, token_ids: list[int], min_prefix: int = 64
@@ -192,7 +195,6 @@ class SessionKVCache:
             f"[session_cache] Stored {len(token_ids)} tokens, "
             f"session={session_key}, active={len(self._sessions)}"
         )
-        self._maybe_persist()
         return session_key
 
     def get_stats(self) -> dict:
@@ -309,9 +311,12 @@ class SessionKVCache:
     def _maybe_persist(self) -> None:
         """Save session cache to disk if enough time has elapsed since last save.
 
-        Runs the actual I/O in a background thread so inference is not blocked.
+        Saves synchronously — MLX arrays cannot be serialized from a
+        background thread because Metal command buffers are not thread-safe.
+        Call this from a safe point between requests (e.g. after generation
+        finishes), not during prefill.
         """
-        if self._cache_dir is None or self._saving:
+        if self._cache_dir is None:
             return
         import time as _time
 
@@ -319,30 +324,14 @@ class SessionKVCache:
         if now - self._last_save_time < self._save_interval:
             return
         self._last_save_time = now
-        self._saving = True
-        # Snapshot session data — list() copies the iteration order,
-        # kv_cache references are shared (MLX arrays are immutable).
         snapshot = [
             (key, (list(token_ids), kv_cache))
             for key, (token_ids, kv_cache) in self._sessions.items()
         ]
-        import threading
-
-        t = threading.Thread(
-            target=self._persist_background,
-            args=(self._cache_dir, snapshot),
-            daemon=True,
-        )
-        t.start()
-
-    def _persist_background(self, cache_dir: str, snapshot: list) -> None:
-        """Background thread wrapper for periodic saves."""
         try:
-            self._save_snapshot(cache_dir, snapshot)
+            self._save_snapshot(self._cache_dir, snapshot)
         except Exception as e:
             logger.warning(f"[session_persist] periodic save failed: {e}")
-        finally:
-            self._saving = False
 
     def _save_snapshot(self, cache_dir: str, snapshot: list) -> bool:
         """Save a snapshot of session data to disk.
@@ -2538,6 +2527,11 @@ class MLLMBatchGenerator:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
                     )
+
+        # Periodic session cache persistence — safe here because generation
+        # has finished and all KV cache arrays are fully evaluated.
+        if self.session_cache is not None:
+            self.session_cache._maybe_persist()
 
     def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
         """Return (processed_tokens, total_tokens) or None."""
