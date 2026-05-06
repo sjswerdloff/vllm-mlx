@@ -725,9 +725,9 @@ class TestSessionKVCache:
         cache = SessionKVCache(max_sessions=4)
         loaded = cache.load_from_disk(cache_dir)
         assert loaded == 0, "No sessions should load (files missing)"
-        assert not os.path.exists(index_path), (
-            "Broken index should be removed so next restart gets clean state"
-        )
+        assert not os.path.exists(
+            index_path
+        ), "Broken index should be removed so next restart gets clean state"
 
     def test_stale_files_cleaned_on_save(self, tmp_path):
         """Verify stale session files from previous saves are cleaned up."""
