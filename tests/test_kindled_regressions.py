@@ -657,8 +657,6 @@ class TestSessionKVCache:
         kv = TrackingKVCache()
         cache.store(tokens, [kv], session_key="test:text")
 
-        import time
-
         initial_save_time = cache._last_save_time
         # _maybe_persist is synchronous now, so it saves immediately
         # if interval has elapsed (save_interval=0, _last_save_time=0)
