@@ -8,6 +8,8 @@ repos:
       - id: check-added-large-files
         args: ['--maxkb=1000']
       - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: ['--branch', 'main', '--branch', 'kindled-main']
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.1.9
