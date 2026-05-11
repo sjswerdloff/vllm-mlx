@@ -233,6 +233,29 @@ class TestConvertMessage:
         args = json.loads(result[0].tool_calls[0]["function"]["arguments"])
         assert args == {"q": "weather"}
 
+    def test_tool_use_arguments_deterministic_serialization(self):
+        """Tool use arguments are serialized with sort_keys for cache stability.
+
+        When the same tool call is sent back on the next turn, the JSON
+        string must be identical regardless of dict iteration order.
+        Different serialization = different tokens = KV cache miss.
+        """
+        msg = AnthropicMessage(
+            role="assistant",
+            content=[
+                AnthropicContentBlock(
+                    type="tool_use",
+                    id="call_det",
+                    name="Edit",
+                    input={"zebra": 1, "alpha": 2, "middle": 3},
+                ),
+            ],
+        )
+        result = _convert_message(msg)
+        args_str = result[0].tool_calls[0]["function"]["arguments"]
+        # sort_keys ensures deterministic order
+        assert args_str == '{"alpha": 2, "middle": 3, "zebra": 1}'
+
     def test_assistant_empty_content(self):
         msg = AnthropicMessage(
             role="assistant",

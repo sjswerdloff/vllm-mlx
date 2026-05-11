@@ -534,18 +534,28 @@ def extract_multimodal_content(
                     else:
                         continue
 
-                    # Chat templates (e.g. Qwen3) iterate arguments|items,
-                    # but OpenAI API sends arguments as a JSON string.
-                    # Parse it into a dict so the template can iterate it.
-                    func = tc_copy.get("function") or {}
-                    args = func.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            import json
+                    # OpenAI API sends arguments as a JSON string.
+                    # Some chat templates need a dict (to iterate keys),
+                    # but modern templates (Qwen3, Hermes) check
+                    # ``arguments is string`` and render verbatim.
+                    # Parsing to dict forces the tojson fallback path,
+                    # which re-serializes with potentially different key
+                    # order/whitespace — breaking KV prefix cache hits
+                    # on subsequent turns.
+                    #
+                    # When preserve_native_format is True the model's
+                    # template is known to handle both forms, so keep
+                    # the string to preserve token-level stability.
+                    if not preserve_native_format:
+                        func = tc_copy.get("function") or {}
+                        args = func.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                import json
 
-                            func["arguments"] = json.loads(args)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
+                                func["arguments"] = json.loads(args)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
 
                     tool_calls_list.append(tc_copy)
 

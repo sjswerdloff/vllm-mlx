@@ -174,6 +174,85 @@ class TestExtractMultimodalContentNativeFormat:
         assert processed[3]["role"] == "user"
         assert processed[3]["content"] == "Thanks!"
 
+    def test_native_format_preserves_arguments_as_string(self):
+        """Native format keeps arguments as JSON string for cache stability.
+
+        When preserve_native_format=True, tool call arguments must NOT be
+        parsed from string to dict. The chat template (e.g. Qwen3.5)
+        checks ``arguments is string`` and renders verbatim. Parsing to
+        dict forces the tojson fallback, which may re-serialize with
+        different key order/whitespace, changing the token sequence and
+        breaking KV prefix cache hits on subsequent turns.
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_xyz",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": '{"file_path": "/tmp/test.txt", "offset": 0}',
+                        },
+                    }
+                ],
+            },
+        ]
+
+        # With native format: arguments stay as string
+        processed, _, _ = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        args = processed[0]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(
+            args, str
+        ), f"Arguments should stay as string for cache stability, got {type(args)}"
+        assert args == '{"file_path": "/tmp/test.txt", "offset": 0}'
+
+        # Without native format: arguments are parsed to dict for
+        # templates that need it
+        processed_default, _, _ = extract_multimodal_content(
+            messages, preserve_native_format=False
+        )
+        # In default mode tool_calls are converted to text, so no
+        # tool_calls field to check — but the text rendering is stable
+
+    def test_native_format_arguments_string_stability_across_key_order(self):
+        """Arguments string is preserved regardless of original key order.
+
+        The model might generate {"b": 1, "a": 2}. When the client sends
+        this back, the exact string must be preserved through the pipeline
+        so tokenization produces identical tokens on the next turn.
+        """
+        # Deliberately non-alphabetical key order
+        original_args = '{"zebra": true, "alpha": false, "middle": 42}'
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_order",
+                        "type": "function",
+                        "function": {
+                            "name": "test_tool",
+                            "arguments": original_args,
+                        },
+                    }
+                ],
+            },
+        ]
+
+        processed, _, _ = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        args = processed[0]["tool_calls"][0]["function"]["arguments"]
+        assert (
+            args == original_args
+        ), f"Key order must be preserved. Expected {original_args!r}, got {args!r}"
+
     def test_empty_tool_call_id(self):
         """Handle empty or missing tool_call_id gracefully."""
         messages = [
