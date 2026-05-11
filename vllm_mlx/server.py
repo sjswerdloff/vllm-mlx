@@ -4407,6 +4407,22 @@ async def _stream_anthropic_messages(
             m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else m
             for m in openai_request.messages
         ]
+        # Convert tool_call arguments from JSON string to dict so that
+        # chat templates can iterate them.  Without this, the streaming
+        # path keeps arguments as strings while the non-streaming path
+        # (via extract_multimodal_content) parses them to dicts —
+        # producing different token sequences and breaking KV cache
+        # prefix matching between streaming and non-streaming requests.
+        if engine.preserve_native_tool_format:
+            for msg_dict in messages:
+                for tc in msg_dict.get("tool_calls") or []:
+                    func = tc.get("function") or {}
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            func["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
     else:
         messages, images, videos = extract_multimodal_content(
             openai_request.messages,

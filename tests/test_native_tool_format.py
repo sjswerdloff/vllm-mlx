@@ -174,6 +174,101 @@ class TestExtractMultimodalContentNativeFormat:
         assert processed[3]["role"] == "user"
         assert processed[3]["content"] == "Thanks!"
 
+    def test_native_format_parses_arguments_to_dict(self):
+        """Native format parses arguments from JSON string to dict.
+
+        Both streaming and non-streaming paths must produce the same
+        message structure — arguments as dicts — so the chat template
+        produces identical tokens regardless of request mode.  This
+        prevents KV cache misses from stream/non-stream alternation.
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_xyz",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": '{"file_path": "/tmp/test.txt", "offset": 0}',
+                        },
+                    }
+                ],
+            },
+        ]
+
+        # With native format: arguments are parsed to dict (matching
+        # the MLLM streaming path in server.py)
+        processed, _, _ = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        args = processed[0]["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(args, dict), (
+            f"Arguments should be parsed to dict for template consistency, "
+            f"got {type(args)}"
+        )
+        assert args == {"file_path": "/tmp/test.txt", "offset": 0}
+
+    def test_streaming_and_nonstreaming_produce_same_arguments(self):
+        """Both paths must parse arguments to dicts for cache stability.
+
+        The actual bug: the Anthropic MLLM streaming path used
+        model_dump() which kept arguments as JSON strings, while the
+        non-streaming path used extract_multimodal_content() which
+        parsed them to dicts. The chat template produces different
+        tokens for string vs dict arguments, so alternating between
+        streaming and non-streaming requests caused KV cache misses.
+
+        This test verifies that extract_multimodal_content (used by
+        the non-streaming path) parses arguments to dicts, matching
+        what the streaming path should also do.
+        """
+        import json
+
+        original_args = '{"file_path": "/src/main.py", "offset": 0}'
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": original_args,
+                        },
+                    }
+                ],
+            },
+        ]
+
+        # Non-streaming path: extract_multimodal_content
+        processed, _, _ = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        args_nonstream = processed[0]["tool_calls"][0]["function"]["arguments"]
+
+        # Streaming path simulation: model_dump + json.loads loop
+        # (matches the server.py MLLM streaming path after the fix)
+        import copy
+
+        stream_msgs = copy.deepcopy(messages)
+        for msg in stream_msgs:
+            for tc in msg.get("tool_calls") or []:
+                func = tc.get("function") or {}
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    func["arguments"] = json.loads(args)
+        args_stream = stream_msgs[0]["tool_calls"][0]["function"]["arguments"]
+
+        # Both must produce dicts with identical content
+        assert isinstance(args_nonstream, dict)
+        assert isinstance(args_stream, dict)
+        assert args_nonstream == args_stream
+
     def test_empty_tool_call_id(self):
         """Handle empty or missing tool_call_id gracefully."""
         messages = [

@@ -534,9 +534,14 @@ def extract_multimodal_content(
                     else:
                         continue
 
-                    # Chat templates (e.g. Qwen3) iterate arguments|items,
-                    # but OpenAI API sends arguments as a JSON string.
-                    # Parse it into a dict so the template can iterate it.
+                    # Chat templates (e.g. Qwen3, GLM-4) iterate
+                    # arguments|items, but OpenAI API sends arguments
+                    # as a JSON string.  Parse it into a dict so the
+                    # template can iterate it.  This must stay in sync
+                    # with the MLLM streaming paths in server.py that
+                    # bypass extract_multimodal_content — both must
+                    # produce identical message dicts to avoid KV cache
+                    # misses from tokenization differences.
                     func = tc_copy.get("function") or {}
                     args = func.get("arguments")
                     if isinstance(args, str):
