@@ -215,7 +215,10 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                 has_images = True
 
         elif block.type == "tool_use":
-            # Assistant message with tool calls
+            # Assistant message with tool calls.
+            # Use sort_keys for deterministic serialization — varying
+            # key order across requests changes the token sequence and
+            # defeats KV prefix cache reuse.
             tool_input = block.input or {}
             tool_calls_for_assistant.append(
                 {
@@ -223,7 +226,9 @@ def _convert_message(msg: AnthropicMessage) -> list[Message]:
                     "type": "function",
                     "function": {
                         "name": block.name or "",
-                        "arguments": json.dumps(tool_input),
+                        "arguments": json.dumps(
+                            tool_input, sort_keys=True, ensure_ascii=False
+                        ),
                     },
                 }
             )
