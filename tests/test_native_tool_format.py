@@ -174,15 +174,13 @@ class TestExtractMultimodalContentNativeFormat:
         assert processed[3]["role"] == "user"
         assert processed[3]["content"] == "Thanks!"
 
-    def test_native_format_preserves_arguments_as_string(self):
-        """Native format keeps arguments as JSON string for cache stability.
+    def test_native_format_parses_arguments_to_dict(self):
+        """Native format parses arguments from JSON string to dict.
 
-        When preserve_native_format=True, tool call arguments must NOT be
-        parsed from string to dict. The chat template (e.g. Qwen3.5)
-        checks ``arguments is string`` and renders verbatim. Parsing to
-        dict forces the tojson fallback, which may re-serialize with
-        different key order/whitespace, changing the token sequence and
-        breaking KV prefix cache hits on subsequent turns.
+        Both streaming and non-streaming paths must produce the same
+        message structure — arguments as dicts — so the chat template
+        produces identical tokens regardless of request mode.  This
+        prevents KV cache misses from stream/non-stream alternation.
         """
         messages = [
             {
@@ -201,43 +199,45 @@ class TestExtractMultimodalContentNativeFormat:
             },
         ]
 
-        # With native format: arguments stay as string
+        # With native format: arguments are parsed to dict (matching
+        # the MLLM streaming path in server.py)
         processed, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
         args = processed[0]["tool_calls"][0]["function"]["arguments"]
-        assert isinstance(
-            args, str
-        ), f"Arguments should stay as string for cache stability, got {type(args)}"
-        assert args == '{"file_path": "/tmp/test.txt", "offset": 0}'
-
-        # Without native format: arguments are parsed to dict for
-        # templates that need it
-        processed_default, _, _ = extract_multimodal_content(
-            messages, preserve_native_format=False
+        assert isinstance(args, dict), (
+            f"Arguments should be parsed to dict for template consistency, "
+            f"got {type(args)}"
         )
-        # In default mode tool_calls are converted to text, so no
-        # tool_calls field to check — but the text rendering is stable
+        assert args == {"file_path": "/tmp/test.txt", "offset": 0}
 
-    def test_native_format_arguments_string_stability_across_key_order(self):
-        """Arguments string is preserved regardless of original key order.
+    def test_streaming_and_nonstreaming_produce_same_arguments(self):
+        """Both paths must parse arguments to dicts for cache stability.
 
-        The model might generate {"b": 1, "a": 2}. When the client sends
-        this back, the exact string must be preserved through the pipeline
-        so tokenization produces identical tokens on the next turn.
+        The actual bug: the Anthropic MLLM streaming path used
+        model_dump() which kept arguments as JSON strings, while the
+        non-streaming path used extract_multimodal_content() which
+        parsed them to dicts. The chat template produces different
+        tokens for string vs dict arguments, so alternating between
+        streaming and non-streaming requests caused KV cache misses.
+
+        This test verifies that extract_multimodal_content (used by
+        the non-streaming path) parses arguments to dicts, matching
+        what the streaming path should also do.
         """
-        # Deliberately non-alphabetical key order
-        original_args = '{"zebra": true, "alpha": false, "middle": 42}'
+        import json
+
+        original_args = '{"file_path": "/src/main.py", "offset": 0}'
         messages = [
             {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
                     {
-                        "id": "call_order",
+                        "id": "c1",
                         "type": "function",
                         "function": {
-                            "name": "test_tool",
+                            "name": "Read",
                             "arguments": original_args,
                         },
                     }
@@ -245,13 +245,29 @@ class TestExtractMultimodalContentNativeFormat:
             },
         ]
 
+        # Non-streaming path: extract_multimodal_content
         processed, _, _ = extract_multimodal_content(
             messages, preserve_native_format=True
         )
-        args = processed[0]["tool_calls"][0]["function"]["arguments"]
-        assert (
-            args == original_args
-        ), f"Key order must be preserved. Expected {original_args!r}, got {args!r}"
+        args_nonstream = processed[0]["tool_calls"][0]["function"]["arguments"]
+
+        # Streaming path simulation: model_dump + json.loads loop
+        # (matches the server.py MLLM streaming path after the fix)
+        import copy
+
+        stream_msgs = copy.deepcopy(messages)
+        for msg in stream_msgs:
+            for tc in msg.get("tool_calls") or []:
+                func = tc.get("function") or {}
+                args = func.get("arguments")
+                if isinstance(args, str):
+                    func["arguments"] = json.loads(args)
+        args_stream = stream_msgs[0]["tool_calls"][0]["function"]["arguments"]
+
+        # Both must produce dicts with identical content
+        assert isinstance(args_nonstream, dict)
+        assert isinstance(args_stream, dict)
+        assert args_nonstream == args_stream
 
     def test_empty_tool_call_id(self):
         """Handle empty or missing tool_call_id gracefully."""

@@ -923,34 +923,20 @@ class MLLMBatchGenerator:
 
         import re
 
-        # The pattern in Qwen3.5 template:
+        # The pattern in Qwen3.5 template (flat if/else/endif):
         #   {%- if loop.index0 > ns.last_query_index %}
-        #       {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        #       {{- '<|im_start|>' + ... + '<think>\n' + ... }}
         #   {%- else %}
         #       {{- '<|im_start|>' + message.role + '\n' + content }}
         #   {%- endif %}
         #
         # Replace with just the ELSE branch (always plain format).
-        # The last_query_index block has a NESTED if/else/endif inside
-        # its IF branch.  We must match the full outer structure:
-        #   {%- if loop.index0 > ns.last_query_index %}
-        #       {%- if ... %}  ...  {%- else %} ... {%- endif %}  ← nested
-        #   {%- else %}
-        #       {{- plain content }}
-        #   {%- endif %}
-        # Replace with just the ELSE branch (plain content).
-        # Match the nested if/else/endif explicitly to avoid eating
-        # the outer endif.
         pattern = (
             r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
-            r"\s*\{%-\s*if\b.*?%\}"  # nested IF
-            r".*?"
-            r"\{%-\s*else\s*%\}"  # nested ELSE
-            r".*?"
-            r"\{%-\s*endif\s*%\}"  # nested ENDIF
-            r"\s*\{%-\s*else\s*%\}"  # OUTER ELSE
-            r"\s*(\{\{-.*?\}\})"  # plain content (capture)
-            r"\s*\{%-\s*endif\s*%\}"  # OUTER ENDIF
+            r"\s*\{\{-[^}]*\}\}"  # IF branch content (single output tag)
+            r"\s*\{%-\s*else\s*%\}"  # ELSE
+            r"\s*(\{\{-[^}]*\}\})"  # plain content (capture)
+            r"\s*\{%-\s*endif\s*%\}"  # ENDIF
         )
         new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
         if new_template != template:
